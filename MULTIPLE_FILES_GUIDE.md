@@ -202,12 +202,3 @@ Typical speeds (local network):
 - Multiple files: Same as single file (files sent sequentially)
 - Directories: Same as multiple files
 
-## Future Enhancements
-
-Planned improvements:
-- [ ] Parallel file transfers for faster speed
-- [ ] Compression support
-- [ ] Resume interrupted transfers
-- [ ] Selective folder transfer (choose which files)
-- [ ] Transfer scheduling
-- [ ] Bandwidth limiting
