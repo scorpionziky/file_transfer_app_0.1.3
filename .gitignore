@@ -19,12 +19,12 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual Environment
+MANIFEST
+.venv
+env/
 venv/
 ENV/
-env/
-.venv
+.env
 
 # IDE
 .vscode/
@@ -36,6 +36,21 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+*.log
 
-# Received files (example)
-received_files/
+# Node (se presente)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Temp files
+*.tmp
+*.bak
+*.swp
+.~*
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
