@@ -204,6 +204,12 @@ class FileTransferGUI:
         self._create_magi_tab()
         self._create_about_tab()
 
+        # NOW reload config after UI elements (output_dir_var, etc.) are created
+        try:
+            self._load_config()
+        except Exception:
+            pass
+
         # Status bar at bottom
         self.status_bar = ttk.Label(root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
