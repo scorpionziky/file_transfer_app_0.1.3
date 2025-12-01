@@ -1,8 +1,8 @@
-# Multiple Files & Directory Transfer - Feature Guide
+# NetLink - Multiple Files & Directory Transfer Guide
 
 ## What's New
 
-Version 0.1.3 now supports sending **multiple files** and **entire directories** in a single transfer!
+NetLink (formerly File Transfer App) v0.1.4 supports sending **multiple files** and **entire directories** in a single transfer, plus pause/resume, retry, compression, and more!
 
 ## Features
 
@@ -158,7 +158,7 @@ To send multiple batches:
 
 **Folder structure not preserved**
 - This is expected behavior - folders are flattened
-- Version 0.1.3 preserves paths in filenames
+- Version 0.1.4 preserves paths in filenames
 - Future versions will improve this
 
 **Permission denied**

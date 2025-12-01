@@ -13,10 +13,13 @@ import time
 
 class TransferClient:
     BUFFER_SIZE = 4096
+    MAX_RETRIES = 3  # Maximum retry attempts on connection error
+    RETRY_DELAY = 2  # Seconds to wait between retries
     
-    def __init__(self, host, port):
+    def __init__(self, host, port, pause_event=None):
         self.host = host
         self.port = port
+        self.pause_event = pause_event  # threading.Event to handle pause/resume
         
     def send_file(self, filepath, progress_callback=None):
         """Send a file or directory to the server (backward compatible)"""
@@ -27,7 +30,17 @@ class TransferClient:
             self.send_single_file(filepath, progress_callback)
     
     def send_single_file(self, filepath, progress_callback=None):
-        """Send a single file to the server"""
+        """Send a single file to the server with automatic retry on connection error"""
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"File not found: {filepath}")
+        
+        def _do_send():
+            return self._send_single_file_internal(filepath, progress_callback)
+        
+        return self._retry_with_backoff(_do_send, f"Sending {filepath.name}")
+    
+    def _send_single_file_internal(self, filepath, progress_callback=None):
         filepath = Path(filepath)
         if not filepath.exists():
             raise FileNotFoundError(f"File not found: {filepath}")
@@ -75,13 +88,12 @@ class TransferClient:
                 raise Exception("Server did not reply with offset for resumable transfer")
             offset = struct.unpack('!Q', offset_data)[0]
 
-            # Log offset negotiation for callers
-            # Send the remaining bytes from offset
             sent = offset
             start_time = time.time()
             with open(filepath, 'rb') as f:
                 f.seek(offset)
                 while sent < filesize:
+                    self._wait_if_paused()
                     to_read = min(self.BUFFER_SIZE, filesize - sent)
                     data = f.read(to_read)
                     if not data:
@@ -110,7 +122,6 @@ class TransferClient:
                 raise Exception("Server reported error after transfer (checksum mismatch?)")
 
             print("File sent successfully!")
-            # Return offset negotiated (0 if fresh) and success flag
             return offset, True
 
     def _recv_exact(self, sock, size):
@@ -123,11 +134,49 @@ class TransferClient:
             data += chunk
         return data
     
+    def _wait_if_paused(self):
+        """Block if pause_event is set (paused), and resume when cleared."""
+        if self.pause_event:
+            self.pause_event.wait()  # Blocks while paused; resumes when event is cleared
+    
+    def _retry_with_backoff(self, operation, operation_name="operation"):
+        """
+        Retry operation with exponential backoff on connection errors.
+        Args:
+            operation: callable that performs the transfer
+            operation_name: string name of operation for logging
+        Returns:
+            Result of operation or None if all retries failed
+        """
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                return operation()
+            except (socket.error, ConnectionError, BrokenPipeError) as e:
+                if attempt < self.MAX_RETRIES:
+                    wait_time = self.RETRY_DELAY * (2 ** (attempt - 1))  # exponential backoff
+                    print(f"\n{operation_name} failed (attempt {attempt}/{self.MAX_RETRIES}): {e}")
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"\n{operation_name} failed after {self.MAX_RETRIES} attempts: {e}")
+                    raise
+    
     def send_multiple_files(self, filepaths, progress_callback=None):
-        """Send multiple files to the server"""
+        """Send multiple files to the server with automatic retry on connection error"""
         filepaths = [Path(f) for f in filepaths]
         
         # Verify all files exist
+        for filepath in filepaths:
+            if not filepath.exists():
+                raise FileNotFoundError(f"File not found: {filepath}")
+        
+        def _do_send():
+            return self._send_multiple_files_internal(filepaths, progress_callback)
+        
+        return self._retry_with_backoff(_do_send, f"Sending {len(filepaths)} file(s)")
+    
+    def _send_multiple_files_internal(self, filepaths, progress_callback=None):
+        filepaths = [Path(f) for f in filepaths]
         for filepath in filepaths:
             if not filepath.exists():
                 raise FileNotFoundError(f"File not found: {filepath}")
@@ -166,6 +215,7 @@ class TransferClient:
                 sent = 0
                 with open(filepath, 'rb') as f:
                     while sent < filesize:
+                        self._wait_if_paused()  # Check and block if paused
                         data = f.read(self.BUFFER_SIZE)
                         if not data:
                             break
@@ -205,7 +255,17 @@ class TransferClient:
             print(f"All {len(filepaths)} file(s) sent successfully!")
     
     def send_directory(self, dirpath, progress_callback=None):
-        """Send entire directory recursively to the server"""
+        """Send entire directory recursively to the server with automatic retry on connection error"""
+        dirpath = Path(dirpath)
+        if not dirpath.is_dir():
+            raise NotADirectoryError(f"Not a directory: {dirpath}")
+        
+        def _do_send():
+            return self._send_directory_internal(dirpath, progress_callback)
+        
+        return self._retry_with_backoff(_do_send, f"Sending directory {dirpath.name}")
+    
+    def _send_directory_internal(self, dirpath, progress_callback=None):
         dirpath = Path(dirpath)
         if not dirpath.is_dir():
             raise NotADirectoryError(f"Not a directory: {dirpath}")
@@ -254,6 +314,7 @@ class TransferClient:
                 sent = 0
                 with open(filepath, 'rb') as f:
                     while sent < filesize:
+                        self._wait_if_paused()  # Check and block if paused
                         data = f.read(self.BUFFER_SIZE)
                         if not data:
                             break

@@ -1,1 +1,10 @@
-{"broadcast_only": false, "partial_cleanup_days": 30, "auto_cleanup_partial": false, "show_peer_details": true}
+{
+  "broadcast_only": false,
+  "partial_cleanup_days": 30,
+  "auto_cleanup_partial": false,
+  "show_peer_details": false,
+  "receive_port": "5000",
+  "output_dir": "C:\\Users\\scorp\\Desktop\\NetLink_0.1.4\\ReceivedFiles",
+  "machine_name": "Andrea01",
+  "nerv_mode": false
+}

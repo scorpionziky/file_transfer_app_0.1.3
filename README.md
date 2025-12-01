@@ -1,4 +1,4 @@
-# File Transfer App
+# NetLink - File Transfer App
 
 A simple, cross-platform command-line application for transferring files between computers over a local network.
 
@@ -25,7 +25,7 @@ A simple, cross-platform command-line application for transferring files between
 A standalone **Windows GUI version** is also available as an **installable `.exe`**.
 
 ➡️ **Download the Windows GUI version**
-*https://github.com/scorpionziky/file_transfer_app_0.1.3/releases/tag/0.1.3*
+*https://github.com/scorpionziky/file_transfer_app_0.1.3/releases/tag/0.1.4*
 
 The Windows installer provides:
 
@@ -36,6 +36,20 @@ The Windows installer provides:
 * Complete interface for sending and receiving files or directories
 
 > **Note:** The `.exe` version is built using PyInstaller.
+
+## What's New in v0.1.4
+
+Version 0.1.4 introduces several enterprise-grade features to enhance reliability and user control:
+
+- **Pause/Resume Transfers** — Control transfer flow by pausing mid-stream and resuming without data loss. Ideal for managing bandwidth on constrained networks.
+- **Automatic Retry Logic** — Failed transfers automatically retry up to 3 times with exponential backoff, eliminating manual intervention for transient network issues.
+- **Optional ZIP Compression** — Enable compression before sending to reduce transfer time by 30-80% depending on file types.
+- **Transfer History** — View detailed logs of past transfers (sent/received) with timestamps, file sizes, and transfer speeds for audit purposes.
+- **File Received Notifications** — Optional system notifications when files arrive, allowing asynchronous monitoring.
+- **Discovery IP Filtering** — Restrict discovery to specific subnets for enhanced security and network organization.
+- **Automatic UI Recovery** — Built-in watchdog monitors UI responsiveness and automatically recovers from temporary freezes.
+
+See [FEATURES_v0.1.4.md](FEATURES_v0.1.4.md) for detailed documentation on each feature.
 
 ## Requirements
 

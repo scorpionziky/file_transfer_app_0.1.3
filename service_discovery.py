@@ -13,7 +13,8 @@ from typing import Dict, Optional, Callable
 class ServiceDiscovery:
     MULTICAST_GROUP = '239.255.77.77'
     MULTICAST_PORT = 5007
-    BEACON_INTERVAL = 1  # reduced interval between beacons (seconds)
+    # Beacon every 1s and treat peers stale after 4s (faster discovery, proven to work)
+    BEACON_INTERVAL = 1  # interval between beacons (seconds)
     TIMEOUT = 4  # timeout for stale peers (seconds)
     
     def __init__(self, machine_name: str, port: int, callback: Optional[Callable] = None, broadcast: bool = True, broadcast_only: bool = False):
@@ -41,6 +42,10 @@ class ServiceDiscovery:
         self.listen_thread = None
         self.cleanup_thread = None
         self.lock = threading.Lock()
+        # Keep references to sockets so we can close them on stop() to
+        # immediately unblock threads waiting on recv/send.
+        self._listen_sock = None
+        self._beacon_sockets = []
         
     def start(self):
         """Start broadcasting and listening for peers"""
@@ -65,12 +70,34 @@ class ServiceDiscovery:
     def stop(self):
         """Stop broadcasting and listening"""
         self.running = False
+        # Close any open sockets to immediately unblock threads
+        try:
+            if self._listen_sock:
+                try:
+                    self._listen_sock.close()
+                except Exception:
+                    pass
+                self._listen_sock = None
+        except Exception:
+            pass
+
+        try:
+            for s in list(self._beacon_sockets):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            self._beacon_sockets.clear()
+        except Exception:
+            pass
+
+        # Join threads with a short timeout to avoid long blocking
         if self.beacon_thread:
-            self.beacon_thread.join(timeout=1)
+            self.beacon_thread.join(timeout=0.5)
         if self.listen_thread:
-            self.listen_thread.join(timeout=1)
+            self.listen_thread.join(timeout=0.5)
         if self.cleanup_thread:
-            self.cleanup_thread.join(timeout=1)
+            self.cleanup_thread.join(timeout=0.5)
             
     def get_peers(self) -> Dict[str, dict]:
         """Get current list of discovered peers"""
@@ -126,6 +153,18 @@ class ServiceDiscovery:
         except Exception:
             broadcast_ok = False
 
+        # remember sockets so stop() can close them
+        try:
+            if multicast_ok and multicast_sock:
+                self._beacon_sockets.append(multicast_sock)
+        except Exception:
+            pass
+        try:
+            if broadcast_ok and broadcast_sock:
+                self._beacon_sockets.append(broadcast_sock)
+        except Exception:
+            pass
+
         try:
             while self.running:
                 msg_bytes = message.encode('utf-8')
@@ -146,9 +185,78 @@ class ServiceDiscovery:
 
                 time.sleep(self.BEACON_INTERVAL)
         finally:
-            if multicast_sock:
-                multicast_sock.close()
-            broadcast_sock.close()
+            # sockets may be closed by stop(); ensure they are removed
+            try:
+                if multicast_sock in self._beacon_sockets:
+                    try:
+                        multicast_sock.close()
+                    except Exception:
+                        pass
+                    try:
+                        self._beacon_sockets.remove(multicast_sock)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if broadcast_sock in self._beacon_sockets:
+                    try:
+                        broadcast_sock.close()
+                    except Exception:
+                        pass
+                    try:
+                        self._beacon_sockets.remove(broadcast_sock)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    def send_beacon_once(self):
+        """Send a single beacon immediately (used to speed up manual refresh)."""
+        message = json.dumps({
+            'name': self.machine_name,
+            'ip': self.local_ip,
+            'port': self.port,
+            'timestamp': time.time()
+        })
+        msg_bytes = message.encode('utf-8')
+
+        # Try multicast if allowed
+        if not self.broadcast_only:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+                except Exception:
+                    pass
+                try:
+                    sock.sendto(msg_bytes, (self.MULTICAST_GROUP, self.MULTICAST_PORT))
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Also send broadcast
+        try:
+            b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                b.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except Exception:
+                pass
+            try:
+                b.sendto(msg_bytes, ('<broadcast>', self.MULTICAST_PORT))
+            except Exception:
+                pass
+            try:
+                b.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
             
     def _listen_for_beacons(self):
         """Listen for beacons from other machines"""
@@ -157,23 +265,36 @@ class ServiceDiscovery:
         
         # Bind to the multicast port
         sock.bind(('', self.MULTICAST_PORT))
+        # keep reference so stop() can close it and unblock recvfrom
+        self._listen_sock = sock
         
-        # Join multicast group on the specific local interface to avoid ambiguity
+        # Join multicast group on the specific local interface to avoid ambiguity.
+        # If local_ip appears to be loopback or unknown, fall back to INADDR_ANY.
         try:
-            mreq = struct.pack('4s4s', socket.inet_aton(self.MULTICAST_GROUP), socket.inet_aton(self.local_ip))
+            if self.local_ip.startswith('127.') or self.local_ip == '0.0.0.0':
+                # Use INADDR_ANY membership
+                mreq = struct.pack('4sl', socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
+            else:
+                mreq = struct.pack('4s4s', socket.inet_aton(self.MULTICAST_GROUP), socket.inet_aton(self.local_ip))
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         except Exception:
-            # Fallback to INADDR_ANY if interface-specific join fails
-            try:
-                mreq = struct.pack('4sl', socket.inet_aton(self.MULTICAST_GROUP), socket.INADDR_ANY)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            except Exception:
-                pass
+            # Best-effort; if this fails we continue — broadcast fallback may still work.
+            pass
         sock.settimeout(1.0)
         
         try:
             while self.running:
                 try:
+                    # If stop() closed the listen socket, exit loop
+                    if not self.running or self._listen_sock is None:
+                        break
+                    try:
+                        fd = sock.fileno()
+                    except Exception:
+                        break
+                    if fd < 0:
+                        break
+
                     data, addr = sock.recvfrom(1024)
                     message = json.loads(data.decode('utf-8'))
                     
@@ -197,11 +318,17 @@ class ServiceDiscovery:
                             
                 except socket.timeout:
                     continue
+                except OSError:
+                    break
                 except (json.JSONDecodeError, KeyError):
                     continue
                     
         finally:
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
+            self._listen_sock = None
             
     def _cleanup_stale_peers(self):
         """Remove peers that haven't been seen recently"""
@@ -225,14 +352,31 @@ class ServiceDiscovery:
                     
     def _get_local_ip(self) -> str:
         """Get local IP address"""
+        # Try a few methods to determine a sensible non-loopback IPv4 address.
+        # 1) Connect to a public IP (doesn't actually send packets) to learn the outbound IP.
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            return ip
-        except:
-            return "127.0.0.1"
+            if ip and not ip.startswith('127.'):
+                return ip
+        except Exception:
+            pass
+
+        # 2) Try hostname resolution to get an IP assigned to this host
+        try:
+            host = socket.gethostname()
+            addrs = socket.getaddrinfo(host, None, family=socket.AF_INET)
+            for a in addrs:
+                candidate = a[4][0]
+                if candidate and not candidate.startswith('127.'):
+                    return candidate
+        except Exception:
+            pass
+
+        # 3) As a last resort, return 0.0.0.0 to indicate 'any interface' (better than loopback for multicast)
+        return '0.0.0.0'
 
 
 # Command-line test

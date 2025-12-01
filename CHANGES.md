@@ -1,4 +1,8 @@
-# Changes in Version 0.1.3
+# Changes in Version 0.1.4
+
+## Major Update: Application Rebranded as **NetLink**
+
+In v0.1.4, we've rebranded the application from **File Transfer App** to **NetLink** to better reflect its core capability of linking machines across networks.
 
 ## Improvements Made
 

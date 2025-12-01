@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-platform File Transfer Application
+NetLink - Cross-platform File Transfer Application
 Supports Windows, Linux, and macOS
 """
 import argparse
@@ -11,7 +11,7 @@ from transfer_client import TransferClient
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Cross-platform file transfer application',
+        description='NetLink - Cross-platform file transfer application',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

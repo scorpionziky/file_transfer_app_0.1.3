@@ -54,3 +54,23 @@ yarn-error.log
 htmlcov/
 .pytest_cache/
 .tox/
+
+# Application runtime and artifacts
+ft_gui_logs.txt
+ft_transfer_history.json
+e2e_recv/
+
+# Generated text docs (created on-demand)
+README.txt
+QUICK_START.txt
+CHANGES.txt
+
+# Test backups and temporary test files
+test_backup/
+tests_backup/
+tests/
+
+# Binary and distribution
+*.exe
+*.dll
+*.pyz
