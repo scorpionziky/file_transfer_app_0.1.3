@@ -5,6 +5,7 @@ Handles receiving files from clients (single files, multiple files, or entire di
 import socket
 import os
 import struct
+import time
 from pathlib import Path
 import hashlib
 
@@ -12,10 +13,12 @@ import hashlib
 class TransferServer:
     BUFFER_SIZE = 4096
     
-    def __init__(self, port=5000, output_dir='.'):
+    def __init__(self, port=5000, output_dir='.', progress_callback=None):
         self.port = port
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Optional callback to report progress: function(sent, total, speed=None, eta=None, filename=None)
+        self.progress_callback = progress_callback
         
     def start(self):
         """Start the server and listen for incoming connections"""
@@ -146,6 +149,9 @@ class TransferServer:
             # Open partial file for append and receive remaining bytes
             received = offset
             with open(partial_path, 'ab') as f:
+                start_time = time.time()
+                last_report = start_time
+                last_bytes = received
                 while received < filesize:
                     to_read = min(self.BUFFER_SIZE, filesize - received)
                     data = conn.recv(to_read)
@@ -154,10 +160,18 @@ class TransferServer:
                         break
                     f.write(data)
                     received += len(data)
-                    # Optional progress print
+
+                    # Report progress via callback if available
                     try:
-                        progress = (received / filesize) * 100
-                        print(f"\rProgress: {progress:.1f}% ({self._format_size(received)}/{self._format_size(filesize)})", end='')
+                        now = time.time()
+                        elapsed = now - start_time
+                        speed = received / elapsed if elapsed > 0 else 0
+                        eta = int((filesize - received) / speed) if speed > 0 else None
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(received, filesize, speed, eta, None)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -262,6 +276,7 @@ class TransferServer:
             
             received = 0
             with open(output_path, 'wb') as f:
+                start_time = time.time()
                 while received < filesize:
                     chunk_size = min(self.BUFFER_SIZE, filesize - received)
                     data = conn.recv(chunk_size)
@@ -270,10 +285,20 @@ class TransferServer:
                         break
                     f.write(data)
                     received += len(data)
-                    
-                    # Progress indicator
-                    progress = (received / filesize) * 100
-                    print(f"\rProgress: {progress:.1f}% ({self._format_size(received)}/{self._format_size(filesize)})", end='')
+
+                    # Report progress via callback if available
+                    try:
+                        now = time.time()
+                        elapsed = now - start_time
+                        speed = received / elapsed if elapsed > 0 else 0
+                        eta = int((filesize - received) / speed) if speed > 0 else None
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(received, filesize, speed, eta, filename)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             
             print(f"\nFile saved to: {output_path.absolute()}")
             
@@ -328,6 +353,7 @@ class TransferServer:
             
             received = 0
             with open(output_path, 'wb') as f:
+                start_time = time.time()
                 while received < filesize:
                     chunk_size = min(self.BUFFER_SIZE, filesize - received)
                     data = conn.recv(chunk_size)
@@ -335,10 +361,20 @@ class TransferServer:
                         break
                     f.write(data)
                     received += len(data)
-                    
-                    # Progress indicator
-                    progress = (received / filesize) * 100
-                    print(f"\rProgress: {progress:.1f}% ({self._format_size(received)}/{self._format_size(filesize)})", end='')
+
+                    # Report progress via callback if available
+                    try:
+                        now = time.time()
+                        elapsed = now - start_time
+                        speed = received / elapsed if elapsed > 0 else 0
+                        eta = int((filesize - received) / speed) if speed > 0 else None
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(received, filesize, speed, eta, filename)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             
             print(f"\nFile saved to: {output_path.absolute()}")
             

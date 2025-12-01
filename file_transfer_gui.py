@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-GUI File Transfer Application
+NetLink - Network File Transfer Application
 Cross-platform graphical interface for file transfers
 """
 import tkinter as tk
@@ -12,10 +12,15 @@ import time
 import webbrowser
 import sys
 import json
+import subprocess
+import zipfile
 from pathlib import Path
 from transfer_server import TransferServer
 from transfer_client import TransferClient
 from service_discovery import ServiceDiscovery
+
+# Application version
+VERSION = "0.1.4"
 
 # Optional drag-and-drop support via tkinterdnd2. If unavailable,
 # the UI will continue to work without DnD.
@@ -52,9 +57,14 @@ except Exception:
 class FileTransferGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("File Transfer Application")
+        self.root.title("NetLink")
         self.root.geometry("800x600")
+        self.root.minsize(800, 600)  # Minimum window size
         self.root.resizable(True, True)
+        
+        # Configure modern font
+        self.default_font = ("Segoe UI", 10)
+        self.title_font = ("Segoe UI", 11, "bold")
 
         # Server thread reference/state
         self.server_thread = None
@@ -75,16 +85,76 @@ class FileTransferGUI:
         # Default: False => use multicast + broadcast
         self.broadcast_only_var = tk.BooleanVar(value=False)
         # Preference: whether to show detailed peer info in the discovered machines list
-        self.show_peer_details = True
+        self.show_peer_details = False
 
         # Selected files to send
         self.selected_files = []
 
-        # Config file path (stored next to this script)
+        # Config file path (stored next to this script or in per-user folder)
         try:
-            self._config_path = Path(__file__).parent / "ft_gui_config.json"
+            # If running as a frozen bundle (PyInstaller), avoid writing next to the
+            # executable's temporary extract folder; use AppData/home instead.
+            is_frozen = getattr(sys, 'frozen', False)
+            candidate = Path(__file__).parent / "ft_gui_config.json"
+            use_candidate = False
+
+            try:
+                import tempfile
+                tempdir = tempfile.gettempdir()
+            except Exception:
+                tempdir = None
+
+            # Determine whether candidate is acceptable (not running frozen and not inside tempdir)
+            try:
+                if not is_frozen:
+                    if tempdir:
+                        # skip candidate if it's inside the system temp directory
+                        try:
+                            if not str(candidate).startswith(str(tempdir)):
+                                use_candidate = True
+                        except Exception:
+                            use_candidate = True
+                    else:
+                        use_candidate = True
+            except Exception:
+                use_candidate = False
+
+            if use_candidate:
+                try:
+                    # test write permission by opening in append mode (won't truncate)
+                    with open(candidate, 'a', encoding='utf-8'):
+                        pass
+                    self._config_path = candidate
+                except Exception:
+                    use_candidate = False
+
+            if not use_candidate:
+                # Fallback to per-user AppData (Windows) or home dir
+                try:
+                    appdata = os.getenv('APPDATA')
+                    if appdata:
+                        cfg_dir = Path(appdata) / "NetLink"
+                    else:
+                        cfg_dir = Path.home() / ".netlink"
+                    cfg_dir.mkdir(parents=True, exist_ok=True)
+                    self._config_path = cfg_dir / "ft_gui_config.json"
+                except Exception:
+                    # Last resort: current working directory
+                    self._config_path = Path("ft_gui_config.json")
         except Exception:
             self._config_path = Path("ft_gui_config.json")
+
+        # Logging file path
+        try:
+            self._log_file_path = Path(__file__).parent / "ft_gui_logs.txt"
+        except Exception:
+            self._log_file_path = Path("ft_gui_logs.txt")
+        # Initialize log file
+        try:
+            with open(self._log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n=== Session started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        except Exception:
+            pass
 
         # Load saved preferences (if any)
         try:
@@ -92,21 +162,46 @@ class FileTransferGUI:
         except Exception:
             pass
 
+        # Initialize preference variables BEFORE creating menu (menu uses these)
+        # Notification preference (beep on new file received)
+        self.notify_on_receive = True
+        
+        # Discovery filter: optional IP subnet filter (e.g., '192.168.1.')
+        self.discovery_ip_filter = None  # None = no filter (accept all)
+        
+        # Compression preference
+        self.compress_before_send = False
+
+        # Transfer control: pause/resume state
+        self.transfer_paused = False
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # Initially not paused
+
+        # Transfer history (for display in Advanced menu)
+        try:
+            self._history_path = Path(__file__).parent / "ft_transfer_history.json"
+        except Exception:
+            self._history_path = Path("ft_transfer_history.json")
+        self.transfer_history = []  # List of {'type': 'send'|'recv', 'filename', 'size', 'timestamp', 'duration_sec'}
+        self._load_transfer_history()
+
         # Create notebook (tabs)
         self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=12)
 
         # Create tabs
         self.send_frame = ttk.Frame(self.notebook)
         self.receive_frame = ttk.Frame(self.notebook)
         self.about_frame = ttk.Frame(self.notebook)
+        self.magi_frame = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.send_frame, text="Send Files")
-        self.notebook.add(self.receive_frame, text="Receive Files")
-        self.notebook.add(self.about_frame, text="About")
+        self.notebook.add(self.send_frame, text="📤 Send Files")
+        self.notebook.add(self.receive_frame, text="📥 Receive Files")
+        self.notebook.add(self.about_frame, text="ℹ️ About")
 
         self._create_send_tab()
         self._create_receive_tab()
+        self._create_magi_tab()
         self._create_about_tab()
 
         # Status bar at bottom
@@ -127,12 +222,40 @@ class FileTransferGUI:
         self.last_peers = {}
         # Maintain current ordered list of peer names shown in the listbox
         self._machines_order = []
+        # Cache for small status images to show colored dots in Treeview
+        self._status_images = {}
+        # Keep references to images used by Treeview items to avoid GC
+        self._item_images = {}
+
+        # Health check: monitor for blocked/stuck threads after standby
+        self._health_check_counter = 0
+        self._last_poll_time = time.time()
+
+        # UI timeout watchdog: detect frozen GUI and refresh/recover
+        self._ui_last_response_time = time.time()
+        self._ui_timeout_threshold = 5  # seconds; if no response in 5s, consider frozen
+        self._ui_frozen_recovered = False  # flag to prevent repeated recovery attempts
 
         # Start discovery after UI is ready
         self.root.after(1000, self.start_discovery_service)
 
         # Start periodic polling to update machines list (every 1.5 seconds)
         self._schedule_discovery_poll()
+
+        # Start health check monitor (every 30 seconds)
+        self._schedule_health_check()
+
+        # Start UI watchdog (every 2 seconds) to detect frozen GUI
+        self._schedule_ui_watchdog()
+
+        # Easter-egg: beta badge click counter and NERV mode state
+        self._beta_click_count = 0
+        self._nerv_mode = False
+        # store original root bg so we can restore later
+        try:
+            self._original_root_bg = self.root.cget('bg')
+        except Exception:
+            self._original_root_bg = None
 
     # -------------------------
     # Discovery helpers
@@ -146,11 +269,129 @@ class FileTransferGUI:
                 if current_peers != self.last_peers:
                     self.last_peers = current_peers
                     self._update_machines_list()
+            # Mark that poll succeeded
+            self._last_poll_time = time.time()
         except Exception:
             pass
 
         # Schedule next poll
         self.root.after(1500, self._schedule_discovery_poll)
+
+    def _schedule_health_check(self):
+        """Schedule periodic health checks to detect and recover from standby-induced freezes."""
+        try:
+            self._health_check()
+        except Exception:
+            pass
+
+        # Schedule next health check (every 30 seconds)
+        self.root.after(30000, self._schedule_health_check)
+
+    def _schedule_ui_watchdog(self):
+        """Schedule periodic UI responsiveness checks."""
+        try:
+            self._ui_watchdog()
+        except Exception:
+            pass
+
+        # Schedule next UI watchdog check (every 2 seconds)
+        self.root.after(2000, self._schedule_ui_watchdog)
+
+    def _get_status_image(self, color_hex: str, size: int = 12):
+        """Return a small circular PhotoImage of the given color.
+
+        Uses PIL Image if available (better rendering). Falls back to None
+        so callers can use a unicode emoji when PIL is not present.
+        """
+        try:
+            # reuse cached image if exists
+            key = f"{color_hex}_{size}"
+            img = self._status_images.get(key)
+            if img:
+                return img
+
+            if PIL_IMAGETK and Image is not None and ImageDraw is not None and ImageTk is not None:
+                im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(im)
+                draw.ellipse((1, 1, size - 2, size - 2), fill=color_hex)
+                pimg = ImageTk.PhotoImage(im)
+                # cache and return
+                self._status_images[key] = pimg
+                return pimg
+            # If PIL not available, return None and let caller use emoji fallback
+            return None
+        except Exception:
+            return None
+
+    def _ui_watchdog(self):
+        """Monitor GUI responsiveness; log warning if UI frozen."""
+        now = time.time()
+        time_since_response = now - self._ui_last_response_time
+        
+        if time_since_response > self._ui_timeout_threshold:
+            if not self._ui_frozen_recovered:
+                try:
+                    self._log_receive(f"[UI Timeout] GUI unresponsive for {time_since_response:.1f}s; attempting recovery...")
+                except Exception:
+                    pass
+                
+                # Attempt recovery: refresh discovery and UI
+                try:
+                    self._ui_frozen_recovered = True
+                    # Force a discovery refresh by calling update_machines_list
+                    self._update_machines_list()
+                except Exception:
+                    pass
+                
+                try:
+                    self._log_receive("[UI Timeout] UI recovery attempted")
+                except Exception:
+                    pass
+        else:
+            # UI is responsive; reset recovery flag
+            self._ui_frozen_recovered = False
+        
+        # Update last response time (called by main loop)
+        self._ui_last_response_time = now
+
+    def _health_check(self):
+        """Check if discovery is responsive; restart if stuck (common after PC standby)."""
+        try:
+            now = time.time()
+            # If the last poll happened more than 60 seconds ago, discovery may be stuck
+            time_since_poll = now - self._last_poll_time
+            
+            if time_since_poll > 60:
+                # Discovery appears stuck; try to recover
+                try:
+                    self._log_receive(f"[Health Check] Discovery unresponsive ({time_since_poll:.0f}s); attempting recovery...")
+                except Exception:
+                    pass
+                
+                # Stop and restart discovery
+                try:
+                    if self.discovery:
+                        try:
+                            self.discovery.stop()
+                        except Exception:
+                            pass
+                        self.discovery = None
+                except Exception:
+                    pass
+                
+                # Restart discovery
+                try:
+                    machine_name = socket.gethostname()
+                    try:
+                        port = int(self.receive_port_entry.get().strip())
+                    except Exception:
+                        port = 5000
+                    self._start_discovery(machine_name, port)
+                    self._log_receive("[Health Check] Discovery restarted successfully")
+                except Exception as e:
+                    self._log_receive(f"[Health Check] Failed to restart discovery: {e}")
+        except Exception:
+            pass
 
     def _start_discovery(self, machine_name: str, port: int):
         """Create and start a ServiceDiscovery instance for this machine."""
@@ -180,6 +421,18 @@ class FileTransferGUI:
             )
             try:
                 self.discovery_mode_var.set(f"Discovery: {mode}")
+            except Exception:
+                pass
+            # keep send tab indicator in sync if present
+            try:
+                if hasattr(self, 'send_discovery_var'):
+                    self.send_discovery_var.set(f"Discovery: {mode}")
+                    # color-code: broadcast-only -> red/orange, otherwise green
+                    # Keep discovery indicator consistently blue regardless of mode
+                    try:
+                        self.send_discovery_label.config(foreground='blue')
+                    except Exception:
+                        pass
             except Exception:
                 pass
             self._log_receive(f"[Discovery] Mode: {mode}")
@@ -221,6 +474,19 @@ class FileTransferGUI:
                 self._write_config()
             except Exception:
                 pass
+            # Update send tab indicator color/text
+            try:
+                mode = (
+                    "broadcast-only" if self.broadcast_only_var.get() else "multicast+broadcast"
+                )
+                if hasattr(self, 'send_discovery_var'):
+                    self.send_discovery_var.set(f"Discovery: {mode}")
+                    try:
+                        self.send_discovery_label.config(foreground='blue')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as e:
             self._log_receive(f"[Discovery ERROR] {e}")
 
@@ -243,6 +509,7 @@ class FileTransferGUI:
     # -------------------------
     # UI: menu, tabs, etc.
     # -------------------------
+
     def _create_menu_bar(self):
         """Create the menu bar"""
         menubar = tk.Menu(self.root)
@@ -253,6 +520,28 @@ class FileTransferGUI:
         menubar.add_cascade(label="Advanced", menu=advanced_menu)
         advanced_menu.add_command(
             label="Manual Connection...", command=self._open_manual_connection_dialog
+        )
+        advanced_menu.add_separator()
+        advanced_menu.add_command(
+            label="Transfer History", command=self._view_transfer_history
+        )
+        advanced_menu.add_command(
+            label="Export Transfer History...", command=self._export_transfer_history_csv
+        )
+        advanced_menu.add_command(
+            label="Clear Transfer History", command=self._clear_transfer_history
+        )
+        advanced_menu.add_separator()
+        advanced_menu.add_command(
+            label="Discovery IP Filter...", command=self._open_discovery_filter_dialog
+        )
+        advanced_menu.add_checkbutton(
+            label="Notify on file received (beep)", variable=tk.BooleanVar(value=self.notify_on_receive),
+            command=lambda: setattr(self, 'notify_on_receive', not self.notify_on_receive)
+        )
+        advanced_menu.add_checkbutton(
+            label="Compress before send (ZIP)", variable=tk.BooleanVar(value=self.compress_before_send),
+            command=lambda: setattr(self, 'compress_before_send', not self.compress_before_send)
         )
 
         # Settings menu
@@ -420,6 +709,50 @@ class FileTransferGUI:
             self._ensure_dialog_visible(guide)
         except Exception:
             pass
+
+    def _ensure_txt_docs(self):
+        """Create .txt copies of documentation .md files if .txt not present.
+
+        This makes it easier for the app to open plain-text files on demand.
+        """
+        try:
+            base = Path(__file__).parent
+        except Exception:
+            return
+
+        pairs = [
+            ("QUICK_START.md", "QUICK_START.txt"),
+            ("README.md", "README.txt"),
+        ]
+
+        for md_name, txt_name in pairs:
+            try:
+                md_path = base / md_name
+                txt_path = base / txt_name
+                if md_path.exists() and not txt_path.exists():
+                    try:
+                        with open(md_path, 'r', encoding='utf-8') as rf:
+                            content = rf.read()
+                        # Write raw markdown to .txt (preserve readable content)
+                        with open(txt_path, 'w', encoding='utf-8') as wf:
+                            wf.write(content)
+                    except Exception:
+                        # If writing fails, skip silently
+                        pass
+            except Exception:
+                pass
+
+    def _refresh_docs_txt(self):
+        """Regenerate .txt documentation files and notify the user."""
+        try:
+            self._ensure_txt_docs()
+            messagebox.showinfo("Refresh Docs TXT", "Documentation .txt files refreshed (if .md present).")
+            self._log_send("Documentation .txt refreshed by user")
+        except Exception as e:
+            try:
+                messagebox.showerror("Refresh Error", f"Could not refresh docs: {e}")
+            except Exception:
+                pass
 
     def _open_quick_guide_en(self):
         """Open a small Quick Guide and Troubleshooting help window (English)."""
@@ -608,6 +941,11 @@ class FileTransferGUI:
 
     def _hide_to_tray(self):
         try:
+            # Persist preferences before hiding to tray so settings remain after closing
+            try:
+                self._write_config()
+            except Exception:
+                pass
             self.root.withdraw()
             self._log_send("Application hidden to tray")
         except Exception:
@@ -623,6 +961,141 @@ class FileTransferGUI:
             self._log_send("Application restored from tray")
         except Exception:
             pass
+
+    def _load_transfer_history(self):
+        """Load transfer history from JSON file."""
+        try:
+            if self._history_path.exists():
+                with open(self._history_path, 'r', encoding='utf-8') as f:
+                    self.transfer_history = json.load(f)
+        except Exception:
+            self.transfer_history = []
+
+    def _save_transfer_history(self):
+        """Save transfer history to JSON file."""
+        try:
+            with open(self._history_path, 'w', encoding='utf-8') as f:
+                json.dump(self.transfer_history[-100:], f, indent=2)  # Keep last 100 entries
+        except Exception:
+            pass
+
+    def _add_transfer_history(self, transfer_type, filename, size_bytes, duration_sec):
+        """Add entry to transfer history (type: 'send' or 'recv')."""
+        try:
+            entry = {
+                'type': transfer_type,
+                'filename': filename,
+                'size_bytes': size_bytes,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'duration_sec': duration_sec,
+                'speed_mbps': (size_bytes / (1024 * 1024)) / max(0.1, duration_sec)
+            }
+            self.transfer_history.append(entry)
+            self._save_transfer_history()
+        except Exception:
+            pass
+
+    def _notify_file_received(self, filename):
+        """Notify user of new received file (beep + visual)."""
+        try:
+            if self.notify_on_receive:
+                # Beep (platform-agnostic using tkinter)
+                try:
+                    self.root.bell()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _view_transfer_history(self):
+        """Show transfer history dialog."""
+        try:
+            hist_win = tk.Toplevel(self.root)
+            hist_win.title("Transfer History")
+            hist_win.geometry("700x400")
+            hist_win.transient(self.root)
+
+            # Text widget with scrollbar
+            text = scrolledtext.ScrolledText(hist_win, height=20, state="disabled", font=("Courier", 9))
+            text.pack(fill="both", expand=True, padx=10, pady=10)
+
+            # Format history
+            text.config(state="normal")
+            if not self.transfer_history:
+                text.insert(tk.END, "No transfers recorded yet.\n")
+            else:
+                text.insert(tk.END, f"{'Type':<6} {'Timestamp':<20} {'Filename':<30} {'Size':<10} {'Duration':<10} {'Speed':<10}\n")
+                text.insert(tk.END, "-" * 100 + "\n")
+                for entry in self.transfer_history[-50:]:  # Show last 50
+                    ttype = entry.get('type', 'unk')
+                    ts = entry.get('timestamp', '')
+                    fname = entry.get('filename', '')[:30]
+                    size = f"{entry.get('size_bytes', 0) / (1024*1024):.1f}MB"
+                    dur = f"{entry.get('duration_sec', 0):.1f}s"
+                    spd = f"{entry.get('speed_mbps', 0):.2f}MB/s"
+                    text.insert(tk.END, f"{ttype:<6} {ts:<20} {fname:<30} {size:<10} {dur:<10} {spd:<10}\n")
+            text.config(state="disabled")
+
+            # Close button
+            ttk.Button(hist_win, text="Close", command=hist_win.destroy).pack(pady=10)
+            self._ensure_dialog_visible(hist_win)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not display history: {e}")
+
+    def _export_transfer_history_csv(self):
+        """Export current transfer history to CSV file chosen by user."""
+        try:
+            if not self.transfer_history:
+                messagebox.showinfo("Export Transfer History", "No transfer history to export.")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Export Transfer History",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*")],
+            )
+            if not path:
+                return
+            # Write CSV
+            import csv
+
+            with open(path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["type", "filename", "size_bytes", "timestamp", "duration_sec", "speed_mbps"])
+                for entry in self.transfer_history:
+                    writer.writerow([
+                        entry.get('type', ''),
+                        entry.get('filename', ''),
+                        entry.get('size_bytes', 0),
+                        entry.get('timestamp', ''),
+                        entry.get('duration_sec', 0),
+                        entry.get('speed_mbps', 0),
+                    ])
+            messagebox.showinfo("Export Transfer History", f"Exported {len(self.transfer_history)} entries to {path}")
+            self._log_send(f"Exported transfer history to {path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not export history: {e}")
+
+    def _clear_transfer_history(self):
+        """Clear stored transfer history after confirmation."""
+        try:
+            if not messagebox.askyesno("Clear Transfer History", "Are you sure you want to clear the stored transfer history? This cannot be undone."):
+                return
+            self.transfer_history = []
+            try:
+                if self._history_path.exists():
+                    try:
+                        self._history_path.unlink()
+                    except Exception:
+                        # fallback: overwrite
+                        self._save_transfer_history()
+                else:
+                    self._save_transfer_history()
+            except Exception:
+                pass
+            self._log_send("Transfer history cleared by user")
+            messagebox.showinfo("Clear Transfer History", "Transfer history cleared.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not clear history: {e}")
 
     def _cleanup_and_exit(self):
         """Stop services and exit the application cleanly."""
@@ -644,6 +1117,10 @@ class FileTransferGUI:
             pass
         try:
             self._write_config()
+        except Exception:
+            pass
+        try:
+            self._save_transfer_history()
         except Exception:
             pass
         try:
@@ -685,9 +1162,9 @@ class FileTransferGUI:
             except Exception:
                 pass
 
-            # Reset broadcast-only preference
+            # Reset broadcast-only preference (default: multicast + broadcast)
             try:
-                self.broadcast_only_var.set(True)
+                self.broadcast_only_var.set(False)
             except Exception:
                 pass
             # Reset partial cleanup preference
@@ -749,6 +1226,33 @@ class FileTransferGUI:
         self.send_port_entry.delete(0, tk.END)
         self.send_port_entry.insert(0, port_str.strip())
 
+    def _open_discovery_filter_dialog(self):
+        """Dialog to set optional IP subnet filter for discovery."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Discovery IP Filter")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("300x150")
+
+        ttk.Label(dialog, text="Filter discovery by IP subnet (optional):").pack(padx=10, pady=10)
+        ttk.Label(dialog, text="Examples: 192.168.1., 10.0., or leave empty for no filter", font=("Arial", 8)).pack(padx=10)
+
+        frame = ttk.Frame(dialog)
+        frame.pack(padx=10, pady=10, fill="x")
+        ttk.Label(frame, text="IP Prefix:").pack(side=tk.LEFT)
+        filter_var = tk.StringVar(value=self.discovery_ip_filter or "")
+        entry = ttk.Entry(frame, textvariable=filter_var, width=20)
+        entry.pack(side=tk.LEFT, padx=5)
+
+        def save_filter():
+            val = filter_var.get().strip()
+            self.discovery_ip_filter = val if val else None
+            messagebox.showinfo("Filter Set", f"Discovery filter: {val if val else 'None (accept all)'}")
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Save", command=save_filter).pack(pady=10)
+        self._ensure_dialog_visible(dialog)
+
     def _open_preferences_dialog(self):
         """Preferences dialog for machine name, folder, default ports"""
         dialog = tk.Toplevel(self.root)
@@ -783,7 +1287,7 @@ class FileTransferGUI:
         discover_chk.pack(side=tk.LEFT)
 
         # Show peer details option
-        details_chk_var = tk.BooleanVar(value=getattr(self, "show_peer_details", True))
+        details_chk_var = tk.BooleanVar(value=getattr(self, "show_peer_details", False))
         details_chk = ttk.Checkbutton(
             frame_discovery,
             text="Show peer details in list (IP/port/last seen)",
@@ -825,7 +1329,10 @@ class FileTransferGUI:
         def _browse_prefs_dir():
             d = filedialog.askdirectory(title="Select save folder")
             if d:
-                dir_var.set(d)
+                try:
+                    dir_var.set(os.path.abspath(d))
+                except Exception:
+                    dir_var.set(d)
 
         ttk.Button(frame_dir, text="Browse", command=_browse_prefs_dir).pack(
             side=tk.LEFT
@@ -881,7 +1388,13 @@ class FileTransferGUI:
             try:
                 self.show_peer_details = bool(details_chk_var.get())
             except Exception:
-                self.show_peer_details = True
+                self.show_peer_details = False
+
+            # Immediately refresh machines list to reflect new preference
+            try:
+                self._update_machines_list()
+            except Exception:
+                pass
 
             dialog.destroy()
 
@@ -974,6 +1487,13 @@ class FileTransferGUI:
         except Exception:
             pass
 
+        # Fallback: bind Ctrl+V for clipboard paste if DnD not available
+        try:
+            if not TKDND_AVAILABLE:
+                self.files_listbox.bind("<Control-v>", lambda e: self._paste_files_from_clipboard())
+        except Exception:
+            pass
+
         btn_frame = ttk.Frame(right_frame)
         btn_frame.pack(fill="x", padx=5, pady=5)
 
@@ -981,7 +1501,10 @@ class FileTransferGUI:
             btn_frame, text="📄 Add File(s)", command=self._browse_files_multiple
         )
         add_file_btn.pack(side=tk.LEFT, padx=2)
-        self._create_tooltip(add_file_btn, "Select one or more files to send")
+        if TKDND_AVAILABLE:
+            self._create_tooltip(add_file_btn, "Select one or more files to send (or drag & drop onto list)")
+        else:
+            self._create_tooltip(add_file_btn, "Select one or more files to send (drag & drop: copy files, Ctrl+V to paste)")
 
         add_folder_btn = ttk.Button(
             btn_frame, text="📁 Add Folder", command=self._browse_directory_to_send
@@ -1011,6 +1534,13 @@ class FileTransferGUI:
             foreground="darkgreen",
         )
         self.selected_receiver_label.pack(anchor=tk.W, padx=5, pady=4)
+        # Discovery mode indicator for Send tab (shows broadcast vs multicast)
+        self.send_discovery_var = tk.StringVar(value="Discovery: unknown")
+        # Show discovery mode in blue for consistency with Receive tab
+        self.send_discovery_label = ttk.Label(
+            receiver_info_frame, textvariable=self.send_discovery_var, foreground="blue"
+        )
+        self.send_discovery_label.pack(anchor=tk.W, padx=5, pady=(0,4))
 
         send_row = ttk.Frame(right_frame)
         # Match horizontal padding with other control rows for visual alignment
@@ -1020,7 +1550,14 @@ class FileTransferGUI:
             send_row, text="▶ SEND FILES", command=self._send_file
         )
         self.send_btn.pack(side=tk.LEFT, padx=2)
-        self._create_tooltip(self.send_btn, "Start file transfer to selected receiver")
+        self._create_tooltip(self.send_btn, "Start file transfer to selected receiver (or pause/resume during transfer)")
+
+        # Pause button (hidden until transfer starts)
+        self.pause_btn = ttk.Button(
+            send_row, text="⏸ PAUSE", command=self._toggle_transfer_pause, state="disabled"
+        )
+        self.pause_btn.pack(side=tk.LEFT, padx=2)
+        self._create_tooltip(self.pause_btn, "Pause/resume ongoing file transfer")
 
         self.resumable_status_var = tk.StringVar(value="Resumable: Off")
         self.resumable_status_label = ttk.Label(
@@ -1204,6 +1741,23 @@ class FileTransferGUI:
         )
         self.receive_log.pack(fill="both", expand=True)
 
+        # Receive progress area
+        recv_progress_frame = ttk.Frame(right_frame)
+        recv_progress_frame.pack(fill="x", padx=5, pady=(5, 8))
+        self.recv_progress = ttk.Progressbar(recv_progress_frame, mode="determinate")
+        self.recv_progress.pack(side=tk.LEFT, fill="x", expand=True)
+        self.recv_progress_percent_var = tk.StringVar(value="0%")
+        ttk.Label(recv_progress_frame, textvariable=self.recv_progress_percent_var, width=6).pack(side=tk.LEFT, padx=6)
+
+        recv_bytes_frame = ttk.Frame(right_frame)
+        recv_bytes_frame.pack(fill="x", padx=5, pady=(0, 4))
+        self.recv_bytes_var = tk.StringVar(value="0 B / 0 B")
+        ttk.Label(recv_bytes_frame, textvariable=self.recv_bytes_var).pack(side=tk.LEFT)
+        self.recv_speed_var = tk.StringVar(value="Speed: -")
+        ttk.Label(recv_bytes_frame, textvariable=self.recv_speed_var).pack(side=tk.LEFT, padx=(10, 0))
+        self.recv_eta_var = tk.StringVar(value="ETA: -")
+        ttk.Label(recv_bytes_frame, textvariable=self.recv_eta_var).pack(side=tk.LEFT, padx=(10, 0))
+
         # Recent files list
         recent_frame = ttk.LabelFrame(right_frame, text="Recently Received Files")
         recent_frame.pack(fill="both", expand=True, padx=0)
@@ -1218,9 +1772,248 @@ class FileTransferGUI:
         recent_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.recent_files_listbox.config(yscrollcommand=recent_scrollbar.set)
         recent_scrollbar.config(command=self.recent_files_listbox.yview)
+        # Bind double-click to open containing folder and select file
+        try:
+            self.recent_files_listbox.bind("<Double-1>", self._on_recent_double_click)
+        except Exception:
+            pass
 
-        # Track recently received files
+        # Track recently received files as list of dicts {'path': fullpath, 'display': display}
         self.recent_received_files = []
+
+    def _create_magi_tab(self):
+        """Create the MAGI System Console tab with boot sequence and dynamic data."""
+        # Main frame with dark background
+        main_frame = tk.Frame(self.magi_frame, bg="#000000")
+        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Console text widget
+        self.magi_console = tk.Text(
+            main_frame,
+            bg="#000000",
+            fg="#00ffaa",
+            font=("Courier", 10),
+            state="disabled",
+            wrap=tk.WORD,
+        )
+        self.magi_console.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Tag for styling different console lines
+        self.magi_console.tag_configure("header", foreground="#00ffff", font=("Courier", 10, "bold"))
+        self.magi_console.tag_configure("success", foreground="#00ff00")
+        self.magi_console.tag_configure("status", foreground="#ffff00")
+        self.magi_console.tag_configure("error", foreground="#ff0000")
+        self.magi_console.tag_configure("system", foreground="#00ffaa")
+
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(main_frame, command=self.magi_console.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.magi_console.config(yscrollcommand=scrollbar.set)
+
+    def _show_magi_tab(self):
+        """Add MAGI Console tab to notebook and start boot sequence."""
+        try:
+            # Check if tab already exists (don't add twice)
+            if self.magi_frame.winfo_manager():
+                return
+            
+            # Insert MAGI tab before About tab (before last tab)
+            self.notebook.insert(2, self.magi_frame, text="⚡ MAGI Console")
+            self.root.after(300, self._start_magi_boot_sequence)
+        except Exception:
+            pass
+
+    def _hide_magi_tab(self):
+        """Remove MAGI Console tab from notebook."""
+        try:
+            # Find and remove MAGI tab by checking all tab IDs
+            tabs = self.notebook.tabs()
+            for tab_id in tabs:
+                try:
+                    # Get the frame associated with this tab
+                    if tab_id == str(self.magi_frame):
+                        self.notebook.forget(tab_id)
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _write_magi_line(self, text, tag="system"):
+        """Write a line to the MAGI console with specified tag."""
+        try:
+            self.magi_console.config(state="normal")
+            self.magi_console.insert(tk.END, text + "\n", tag)
+            self.magi_console.see(tk.END)
+            self.magi_console.config(state="disabled")
+            self.magi_console.update()
+        except Exception:
+            pass
+
+    def _start_magi_boot_sequence(self):
+        """Start the animated MAGI boot sequence (one-time animation, no loop)."""
+        try:
+            # Clear console
+            self.magi_console.config(state="normal")
+            self.magi_console.delete("1.0", tk.END)
+            self.magi_console.config(state="disabled")
+
+            # Get dynamic data once
+            connection = self._get_magi_connection_status()
+            latency = self._get_magi_latency()
+            packet_loss = self._get_magi_packet_loss()
+            bandwidth = self._get_magi_bandwidth()
+            
+            transfer_speed = self._get_magi_transfer_speed()
+            files_sent = self._get_magi_files_sent()
+            files_pending = self._get_magi_files_pending()
+            
+            cpu_load = self._get_magi_cpu_load()
+            memory_usage = self._get_magi_memory_usage()
+            device_status = self._get_magi_device_status()
+            
+            auth_status = self._get_magi_auth_status()
+            encryption = self._get_magi_encryption()
+
+            # Complete boot sequence + status in single animation
+            boot_lines = [
+                ("", "system"),
+                ("[MAGI SYSTEM BOOT v1.0]", "header"),
+                (">>> INITIALIZING MODULES", "status"),
+                ("   Melchior ............. OK", "success"),
+                ("   Balthasar ............ OK", "success"),
+                ("   Casper ............... OK", "success"),
+                (">>> SYNCHRONIZATION .... COMPLETE", "status"),
+                (">>> TRINARY DECISION ENGINE ONLINE", "status"),
+                ("", "system"),
+                ("[CONNECTION STATUS]", "header"),
+                (f"CONNECTION: {connection}", "system"),
+                (f"LATENCY: {latency}", "system"),
+                (f"PACKET LOSS: {packet_loss}", "system"),
+                (f"BANDWIDTH: {bandwidth}", "system"),
+                ("", "system"),
+                ("[TRANSFER MODULE]", "header"),
+                (f"TRANSFER SPEED: {transfer_speed}", "system"),
+                (f"FILES SENT: {files_sent}", "system"),
+                (f"FILES PENDING: {files_pending}", "system"),
+                ("", "system"),
+                ("[DEVICE STATUS]", "header"),
+                (f"CPU LOAD: {cpu_load}", "system"),
+                (f"MEMORY USAGE: {memory_usage}", "system"),
+                (f"DEVICE STATUS: {device_status}", "system"),
+                ("", "system"),
+                ("[SECURITY CHECK]", "header"),
+                (f"AUTH STATUS: {auth_status}", "system"),
+                (f"ENCRYPTION: {encryption}", "system"),
+                ("", "system"),
+                (">>> MAGI SYSTEM READY", "status"),
+            ]
+
+            # Write lines with animation (one-time, no loop)
+            for idx, (line, tag) in enumerate(boot_lines):
+                try:
+                    self.root.after(idx * 150, lambda l=line, t=tag: self._write_magi_line(l, t))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # MAGI Dynamic Data Functions
+    def _get_magi_connection_status(self):
+        """Get connection status."""
+        try:
+            if self.discovery and self.discovery.get_peers():
+                return "ONLINE"
+            return "OFFLINE"
+        except Exception:
+            return "UNKNOWN"
+
+    def _get_magi_latency(self):
+        """Get simulated latency (ms)."""
+        try:
+            import random
+            return f"{random.randint(1, 50)} ms"
+        except Exception:
+            return "N/A"
+
+    def _get_magi_packet_loss(self):
+        """Get simulated packet loss."""
+        try:
+            import random
+            return f"{random.randint(0, 2)}%"
+        except Exception:
+            return "N/A"
+
+    def _get_magi_bandwidth(self):
+        """Get simulated bandwidth usage."""
+        try:
+            import random
+            return f"{random.randint(10, 95)} Mbps"
+        except Exception:
+            return "N/A"
+
+    def _get_magi_transfer_speed(self):
+        """Get current transfer speed."""
+        try:
+            if self.server_running:
+                import random
+                return f"{random.randint(5, 50)} MB/s"
+            return "0 MB/s"
+        except Exception:
+            return "N/A"
+
+    def _get_magi_files_sent(self):
+        """Get count of files sent."""
+        try:
+            sent_count = sum(1 for e in self.transfer_history if e.get('type') == 'send')
+            return str(sent_count)
+        except Exception:
+            return "0"
+
+    def _get_magi_files_pending(self):
+        """Get simulated pending files."""
+        try:
+            import random
+            return str(random.randint(0, 5))
+        except Exception:
+            return "0"
+
+    def _get_magi_cpu_load(self):
+        """Get simulated CPU load."""
+        try:
+            import random
+            return f"{random.randint(5, 45)}%"
+        except Exception:
+            return "N/A"
+
+    def _get_magi_memory_usage(self):
+        """Get simulated memory usage."""
+        try:
+            import random
+            return f"{random.randint(100, 500)} MB"
+        except Exception:
+            return "N/A"
+
+    def _get_magi_device_status(self):
+        """Get device status."""
+        try:
+            return "OPERATIONAL"
+        except Exception:
+            return "UNKNOWN"
+
+    def _get_magi_auth_status(self):
+        """Get authentication status."""
+        try:
+            return "AUTHORIZED"
+        except Exception:
+            return "UNKNOWN"
+
+    def _get_magi_encryption(self):
+        """Get encryption status."""
+        try:
+            return "AES-256 ENABLED"
+        except Exception:
+            return "DISABLED"
 
     def _create_about_tab(self):
         """Create the About tab with scrollbar - centered layout"""
@@ -1242,22 +2035,25 @@ class FileTransferGUI:
 
         # Center the content
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        # Inner container to center content horizontally
+        content_container = ttk.Frame(scrollable_frame)
+        content_container.pack(fill="both", expand=True, padx=20)
         canvas.configure(yscrollcommand=scrollbar.set)
 
         # Pack canvas and scrollbar
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Application header - centered
-        header_frame = ttk.Frame(scrollable_frame)
-        header_frame.pack(fill="x", pady=(0, 20), padx=20, anchor="center")
+        # Application header - centered inside content container
+        header_frame = ttk.Frame(content_container)
+        header_frame.pack(pady=(0, 20), anchor="center")
 
         # Application title with larger font
         title_label = ttk.Label(
             header_frame,
-            text="File Transfer Application",
-            font=("Arial", 16, "bold"),
-            foreground="#2c3e50",
+            text="NetLink",
+            font=("Arial", 18, "bold"),
+            foreground="#0066cc",
         )
         title_label.pack(pady=(0, 10), anchor="center")
 
@@ -1266,9 +2062,9 @@ class FileTransferGUI:
         version_frame.pack(anchor="center")
 
         version_label = ttk.Label(
-            version_frame, text="Version 0.1.3", font=("Arial", 12, "bold")
+            version_frame, text=f"v{VERSION}", font=("Arial", 10, "bold"), foreground="#555555"
         )
-        version_label.pack(side=tk.LEFT, padx=(0, 10))
+        version_label.pack(side=tk.LEFT, padx=(0, 15))
 
         # Beta testing badge
         beta_label = ttk.Label(
@@ -1280,15 +2076,32 @@ class FileTransferGUI:
             padding=(6, 2),
         )
         beta_label.pack(side=tk.LEFT)
+        try:
+            # Bind clicks to the easter-egg handler (7 clicks activates)
+            beta_label.bind("<Button-1>", lambda e: self._on_beta_click())
+        except Exception:
+            pass
+
+        # Hidden NERV authorization label (shown when NERV Mode active)
+        try:
+            self.nerv_status_label = ttk.Label(
+                header_frame,
+                text="NERV AUTHORIZATION LEVEL 3 CONFIRMED.",
+                font=("Courier", 9, "bold"),
+                foreground="#ff4444",
+            )
+            # do not pack now; shown only when NERV mode is active
+        except Exception:
+            self.nerv_status_label = None
 
         # Separator
-        ttk.Separator(scrollable_frame, orient="horizontal").pack(
-            fill="x", pady=20, padx=20
+        ttk.Separator(content_container, orient="horizontal").pack(
+            fill="x", pady=20
         )
 
         # Features section
-        features_frame = ttk.LabelFrame(scrollable_frame, text="Features")
-        features_frame.pack(fill="x", pady=(0, 20), padx=20, anchor="center")
+        features_frame = ttk.LabelFrame(content_container, text="Features")
+        features_frame.pack(fill="x", pady=(0, 20), anchor="center")
 
         features_text = """
 • Cross-platform compatibility (Windows, macOS, Linux)
@@ -1310,8 +2123,8 @@ class FileTransferGUI:
         features_label.pack(padx=10, pady=10, anchor=tk.W)
 
         # Author information
-        author_frame = ttk.LabelFrame(scrollable_frame, text="Developer Information")
-        author_frame.pack(fill="x", pady=(0, 20), padx=20, anchor="center")
+        author_frame = ttk.LabelFrame(content_container, text="Developer Information")
+        author_frame.pack(fill="x", pady=(0, 20), anchor="center")
 
         author_text = """
 Developed by: Scorpionziky
@@ -1334,8 +2147,37 @@ the methods below.
         author_label.pack(padx=10, pady=10, anchor=tk.W)
 
         # Contact methods
-        contact_frame = ttk.LabelFrame(scrollable_frame, text="Contact & Support")
-        contact_frame.pack(fill="x", pady=(0, 20), padx=20, anchor="center")
+        contact_frame = ttk.LabelFrame(content_container, text="Contact & Support")
+        contact_frame.pack(fill="x", pady=(0, 20), anchor="center")
+
+        # Documentation links (create .txt on demand from .md and open)
+        links_frame = ttk.LabelFrame(content_container, text="Documentation")
+        links_frame.pack(fill="x", pady=(0, 20), anchor="center")
+
+        def _open_create_txt(md_name, txt_name):
+            base = Path(__file__).parent
+            md_path = base / md_name
+            txt_path = base / txt_name
+            # If .txt doesn't exist but .md does, create .txt from .md
+            try:
+                if not txt_path.exists() and md_path.exists():
+                    try:
+                        with open(md_path, 'r', encoding='utf-8') as rf:
+                            content = rf.read()
+                        with open(txt_path, 'w', encoding='utf-8') as wf:
+                            wf.write(content)
+                    except Exception:
+                        pass
+                # Prefer opening the .txt if exists, else open .md if exists
+                if txt_path.exists():
+                    webbrowser.open('file://' + str(txt_path))
+                elif md_path.exists():
+                    webbrowser.open('file://' + str(md_path))
+            except Exception:
+                pass
+
+        ttk.Button(links_frame, text="Open QUICK_START", command=lambda: _open_create_txt('QUICK_START.md', 'QUICK_START.txt')).pack(padx=10, pady=6, anchor=tk.W)
+        ttk.Button(links_frame, text="Open README", command=lambda: _open_create_txt('README.md', 'README.txt')).pack(padx=10, pady=6, anchor=tk.W)
 
         # Email
         email_frame = ttk.Frame(contact_frame)
@@ -1445,6 +2287,173 @@ project on GitHub or contributing to its development!
     def _create_tooltip(self, widget, text):
         """Create a tooltip for a widget."""
 
+    # -------------------------
+    # Easter-egg: NERV emergency and theme
+    # -------------------------
+    def _on_beta_click(self):
+        """Handle clicks on the BETA label. 7 clicks toggles/activates NERV."""
+        try:
+            self._beta_click_count = getattr(self, '_beta_click_count', 0) + 1
+            # reset counter if too large
+            if self._beta_click_count > 7:
+                self._beta_click_count = 1
+
+            if self._beta_click_count >= 7:
+                # Reset counter
+                self._beta_click_count = 0
+                # Toggle behavior: if already in nerv mode, deactivate; otherwise show emergency + activate
+                if getattr(self, '_nerv_mode', False):
+                    try:
+                        self._deactivate_nerv_mode()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        # Show emergency modal and play NERV beep
+                        self._show_nerv_emergency_modal()
+                    except Exception:
+                        pass
+                    try:
+                        # Activate NERV theme after showing modal
+                        self._activate_nerv_mode()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _play_nerv_beep(self):
+        """Play a short sequence of beeps similar to the NERV alert (Windows fallback to bell)."""
+        try:
+            if sys.platform.startswith("win"):
+                try:
+                    import winsound
+
+                    # A short sequence of two beeps
+                    winsound.Beep(750, 300)
+                    time.sleep(0.12)
+                    winsound.Beep(1000, 220)
+                except Exception:
+                    try:
+                        self.root.bell()
+                        time.sleep(0.1)
+                        self.root.bell()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    # Non-Windows: use bell twice
+                    self.root.bell()
+                    time.sleep(0.12)
+                    self.root.bell()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _activate_nerv_mode(self):
+        """Show NERV status text, reveal MAGI Console tab, and log activation."""
+        try:
+            if getattr(self, '_nerv_mode', False):
+                return
+            self._nerv_mode = True
+
+            # Show the small NERV confirmation under the header if present
+            try:
+                if getattr(self, 'nerv_status_label', None):
+                    try:
+                        self.nerv_status_label.pack(pady=(4, 10))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Show MAGI Console tab
+            try:
+                self._show_magi_tab()
+            except Exception:
+                pass
+
+            # Save NERV mode state to config
+            try:
+                self._write_config()
+            except Exception:
+                pass
+
+            # Log activation
+            try:
+                self._log_send("[EasterEgg] NERV Mode activated")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _deactivate_nerv_mode(self):
+        """Hide NERV status text, hide MAGI Console tab, and log deactivation."""
+        try:
+            if not getattr(self, '_nerv_mode', False):
+                return
+            self._nerv_mode = False
+
+            try:
+                if getattr(self, 'nerv_status_label', None):
+                    try:
+                        self.nerv_status_label.pack_forget()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Hide MAGI Console tab
+            try:
+                self._hide_magi_tab()
+            except Exception:
+                pass
+
+            # Save NERV mode state to config
+            try:
+                self._write_config()
+            except Exception:
+                pass
+
+            try:
+                self._log_send("[EasterEgg] NERV Mode deactivated")
+            except Exception:
+                pass
+
+            try:
+                messagebox.showinfo("NERV Mode", "NERV Mode deactivated.")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _restore_nerv_mode_on_startup(self):
+        """Restore NERV mode on startup if it was previously activated."""
+        try:
+            if getattr(self, '_nerv_mode', False):
+                # Show NERV label
+                try:
+                    if getattr(self, 'nerv_status_label', None):
+                        try:
+                            self.nerv_status_label.pack(pady=(4, 10))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Show MAGI Console tab
+                try:
+                    self._show_magi_tab()
+                except Exception:
+                    pass
+
+                try:
+                    self._log_send("[EasterEgg] NERV Mode restored from config")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         def on_enter(event):
             tooltip = tk.Toplevel()
             tooltip.wm_overrideredirect(True)
@@ -1484,12 +2493,22 @@ project on GitHub or contributing to its development!
             size_str = self._format_file_size(filesize)
             display = f"{filename} ({size_str})"
 
+            # Determine full path: if filename absolute, use it; otherwise join with output dir
+            try:
+                p = Path(filename)
+                if not p.is_absolute():
+                    fullpath = os.path.join(self.output_dir_var.get(), filename)
+                else:
+                    fullpath = str(p)
+            except Exception:
+                fullpath = os.path.join(self.output_dir_var.get(), filename)
+
             # Keep only last 20 files
             if len(self.recent_received_files) >= 20:
                 self.recent_files_listbox.delete(0, 0)
                 self.recent_received_files.pop(0)
 
-            self.recent_received_files.append(display)
+            self.recent_received_files.append({"path": fullpath, "display": display})
             self.recent_files_listbox.insert(tk.END, display)
             self.recent_files_listbox.see(tk.END)
         except Exception:
@@ -1499,7 +2518,7 @@ project on GitHub or contributing to its development!
         """Update badge on Receive Files tab when files arrive."""
         try:
             if self.recent_received_files:
-                self.notebook.tab(1, text=f"Receive Files 🔔")
+                self.notebook.tab(1, text=f"Receive Files ðŸ””")
             else:
                 self.notebook.tab(1, text="Receive Files")
         except Exception:
@@ -1549,19 +2568,24 @@ project on GitHub or contributing to its development!
     def _refresh_discovery(self):
         """Force refresh of discovered machines list"""
         self._log_send("Scanning for machines...")
-
         if not self.discovery:
+            # Start discovery service if missing
             self.start_discovery_service()
+            # give it a short moment to populate
             self.root.after(2000, self._update_machines_list)
+            count = 0
         else:
-            # Discovery exists, force update
-            self._update_machines_list()
+            # If discovery already running, ask it to emit a beacon now
+            try:
+                # send an immediate beacon to speed up detection
+                self.discovery.send_beacon_once()
+            except Exception:
+                pass
+            # schedule a UI update shortly to show new peers
+            self.root.after(1000, self._update_machines_list)
+            count = len(self.discovery.get_peers())
 
-        self._log_send(
-            "Scan complete. Found "
-            + str(len(self.discovery.get_peers() if self.discovery else {}))
-            + " machines."
-        )
+        self._log_send(f"Scan complete. Found {count} machines.")
 
     def _on_machine_select(self, event):
         """Handle machine selection from listbox"""
@@ -1580,11 +2604,60 @@ project on GitHub or contributing to its development!
                 self.host_entry.insert(0, peer_info["ip"])
                 self.send_port_entry.delete(0, tk.END)
                 self.send_port_entry.insert(0, str(peer_info["port"]))
-                # Update selected receiver label with green highlight
-                self.selected_receiver_var.set(
-                    f"🟢 {machine_name}\n({peer_info['ip']}:{peer_info['port']})"
-                )
-                self.selected_receiver_label.config(foreground="darkgreen")
+                # Determine age and choose status color/icon
+                try:
+                    now = time.time()
+                    last = peer_info.get("last_seen")
+                    if last:
+                        age = int(now - float(last))
+                    else:
+                        age = None
+                except Exception:
+                    age = None
+
+                if age is None:
+                    color = "#3498db"
+                else:
+                    if age < 5:
+                        color = "#2ecc71"  # green
+                    elif age < 30:
+                        color = "#f1c40f"  # yellow
+                    else:
+                        color = "#95a5a6"  # gray
+
+                # Try to get a small colored image; fallback to emoji
+                status_img = self._get_status_image(color, size=14)
+                display_text = f"{machine_name}\n({peer_info['ip']}:{peer_info['port']})"
+                if status_img is not None:
+                    self._selected_receiver_image = status_img
+                    try:
+                        # Use image on the left of the label
+                        self.selected_receiver_label.config(image=status_img, compound='left')
+                    except Exception:
+                        # fallback to text-only
+                        self.selected_receiver_label.config(image='')
+                else:
+                    # Emoji fallback
+                    if color == "#2ecc71":
+                        status_icon = "\U0001F7E2"  # 🟢
+                    elif color == "#f1c40f":
+                        status_icon = "\U0001F7E1"  # 🟡
+                    elif color == "#95a5a6":
+                        status_icon = "\u26AA"     # ⚪
+                    else:
+                        status_icon = "\u25CF"     # ●
+                    display_text = f"{status_icon} {display_text}"
+                    try:
+                        self.selected_receiver_label.config(image='')
+                    except Exception:
+                        pass
+
+                # Update label text and color
+                self.selected_receiver_var.set(display_text)
+                try:
+                    self.selected_receiver_label.config(foreground="darkgreen")
+                except Exception:
+                    pass
 
     def _update_machines_list(self):
         """Update the list of discovered machines"""
@@ -1606,27 +2679,68 @@ project on GitHub or contributing to its development!
             port = info.get("port", "")
             last_seen_ts = info.get("last_seen")
 
-            # Determine status indicator
+            # Apply IP filter if set
+            if self.discovery_ip_filter and ip != "unknown":
+                if not ip.startswith(self.discovery_ip_filter):
+                    continue  # Skip this peer if it doesn't match filter
+
+            # Determine status indicator (use reliable Unicode codepoints to avoid mojibake)
             if last_seen_ts:
                 age = int(now - float(last_seen_ts))
                 if age < 5:
-                    status_icon = "🟢"  # Online
+                    status_icon = "\U0001F7E2"  # 🟢 Online
                 elif age < 30:
-                    status_icon = "🟡"  # Recently seen
+                    status_icon = "\U0001F7E1"  # 🟡 Recently seen
                 else:
-                    status_icon = "⚫"  # Offline/stale
+                    status_icon = "\u26AA"     # ⚪ Offline/stale
                 age_str = self._human_readable_age(age)
             else:
-                status_icon = "🔵"
+                status_icon = "\u25CB"  # ○ unknown / just seen
                 age_str = "now"
 
-            if getattr(self, "show_peer_details", True):
+            # Always show a small status indicator (emoji) next to the name so the
+            # colored dot is visible in both simple and detailed modes.
+            if getattr(self, "show_peer_details", False):
+                # Detailed view: include status icon, IP, port and last seen
                 display_name = f"{status_icon} {name} ({ip}:{port}) [{age_str}]"
             else:
+                # Simple view (default): show status icon and machine name only
                 display_name = f"{status_icon} {name}"
 
-            # Insert into treeview
-            item = self.machines_tree.insert("", "end", text=display_name)
+            # Insert into treeview. Prefer using a small colored image for the
+            # status dot (PIL required). If not available, prefix the name
+            # with a Unicode emoji as fallback.
+            # Determine color for status
+            if last_seen_ts:
+                if age < 5:
+                    color = "#2ecc71"  # green
+                elif age < 30:
+                    color = "#f1c40f"  # yellow
+                else:
+                    color = "#95a5a6"  # gray
+            else:
+                color = "#3498db"  # blue for unknown
+
+            status_img = self._get_status_image(color)
+            if status_img is not None:
+                # Use display_name so 'show_peer_details' is respected even when an image is shown
+                item = self.machines_tree.insert("", "end", text=display_name, image=status_img)
+                # keep reference to avoid GC
+                self._item_images[item] = status_img
+            else:
+                # fallback: include a colored emoji if images unavailable
+                # note: some platforms may render emoji monochrome
+                if color == "#2ecc71":
+                    status_icon = "\U0001F7E2"  # 🟢
+                elif color == "#f1c40f":
+                    status_icon = "\U0001F7E1"  # 🟡
+                elif color == "#95a5a6":
+                    status_icon = "\u26AA"     # ⚪
+                else:
+                    status_icon = "\u25CF"     # ●
+
+                # Use the precomputed display_name (may include status icon and details)
+                item = self.machines_tree.insert("", "end", text=display_name)
 
             self._machines_order.append(name)
             self._item_to_name[item] = name
@@ -1730,6 +2844,10 @@ project on GitHub or contributing to its development!
         """Browse for output directory"""
         directory = filedialog.askdirectory(title="Select directory for received files")
         if directory:
+            try:
+                directory = os.path.abspath(directory)
+            except Exception:
+                pass
             self.output_dir_var.set(directory)
 
     def _human_readable_age(self, seconds: int) -> str:
@@ -1768,27 +2886,86 @@ project on GitHub or contributing to its development!
             except Exception:
                 pass
 
+    def _paste_files_from_clipboard(self):
+        """Fallback method to paste files from clipboard when DnD is unavailable."""
+        try:
+            # Get clipboard content and parse file paths (Windows file paths are separated by \r\n)
+            clipboard_content = self.root.clipboard_get()
+            if not clipboard_content:
+                return
+            paths = [p.strip() for p in clipboard_content.split('\n') if p.strip()]
+            added = 0
+            for p in paths:
+                # Remove quotes if present (sometimes Windows puts paths in quotes)
+                p = p.strip('"')
+                if os.path.exists(p):
+                    if p not in self.selected_files:
+                        self.selected_files.append(p)
+                        added += 1
+            if added:
+                self._update_files_listbox()
+                self._log_send(f"Added {added} file(s)/folder(s) via clipboard paste (Ctrl+V)")
+            else:
+                self._log_send("Clipboard does not contain valid file paths")
+        except Exception as e:
+            try:
+                self._log_send(f"Clipboard paste error: {e}")
+            except Exception:
+                pass
+
     def _log_send(self, message):
-        """Add message to send log"""
+        """Add message to send log and write to file. `level` default INFO."""
         self.send_log.config(state="normal")
-        timestamp = time.strftime("%H:%M:%S")
-        self.send_log.insert(tk.END, f"[{timestamp}] {message}\n")
+        timestamp_local = time.strftime("%H:%M:%S")
+        iso_ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.send_log.insert(tk.END, f"[{timestamp_local}] {message}\n")
         self.send_log.see(tk.END)
         self.send_log.config(state="disabled")
         self.status_bar.config(text=f"Send: {message}")
+        # Write to log file with ISO timestamp and level
+        try:
+            with open(self._log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{iso_ts}] [INFO] [SEND] {message}\n")
+        except Exception:
+            pass
 
     def _log_receive(self, message):
-        """Add message to receive log"""
+        """Add message to receive log and write to file. `level` default INFO."""
         self.receive_log.config(state="normal")
-        timestamp = time.strftime("%H:%M:%S")
-        self.receive_log.insert(tk.END, f"[{timestamp}] {message}\n")
+        timestamp_local = time.strftime("%H:%M:%S")
+        iso_ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.receive_log.insert(tk.END, f"[{timestamp_local}] {message}\n")
         self.receive_log.see(tk.END)
         self.receive_log.config(state="disabled")
         self.status_bar.config(text=f"Receive: {message}")
+        # Write to log file with ISO timestamp and level
+        try:
+            with open(self._log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{iso_ts}] [INFO] [RECV] {message}\n")
+        except Exception:
+            pass
 
     # -------------------------
     # Sending logic (uses TransferClient)
     # -------------------------
+    def _toggle_transfer_pause(self):
+        """Toggle pause/resume for ongoing file transfer"""
+        try:
+            if self.transfer_paused:
+                # Resume
+                self._pause_event.set()
+                self.transfer_paused = False
+                self.pause_btn.config(text="⏸ PAUSE")
+                self._log_send("[Transfer] Resumed")
+            else:
+                # Pause
+                self._pause_event.clear()
+                self.transfer_paused = True
+                self.pause_btn.config(text="▶ RESUME")
+                self._log_send("[Transfer] Paused")
+        except Exception as e:
+            self._log_send(f"Pause toggle error: {e}")
+
     def _send_file(self):
         """Send file(s) or folder in separate thread"""
         host = self.host_entry.get().strip()
@@ -1819,9 +2996,15 @@ project on GitHub or contributing to its development!
 
         # Disable button during transfer
         self.send_btn.config(state="disabled")
+        self.pause_btn.config(state="normal")
         self.send_progress["value"] = 0
         self._log_send(f"Starting transfer to {host}:{port}...")
         self._log_send(f"Files to send: {len(self.selected_files)}")
+
+        # Reset pause state
+        self.transfer_paused = False
+        self._pause_event.set()
+        self.pause_btn.config(text="⏸ PAUSE")
 
         # Run transfer in thread
         thread = threading.Thread(
@@ -1830,10 +3013,52 @@ project on GitHub or contributing to its development!
         thread.daemon = True
         thread.start()
 
+    def _compress_files_to_zip(self, filepaths):
+        """
+        Compress files into a ZIP archive.
+        Args:
+            filepaths: list of file paths to compress
+        Returns:
+            path to the created ZIP file
+        """
+        try:
+            import tempfile
+            # Create temporary ZIP file
+            fd, zip_path = tempfile.mkstemp(suffix='.zip', prefix='ft_')
+            os.close(fd)
+            
+            zip_path = Path(zip_path)
+            self._log_send(f"Compressing {len(filepaths)} file(s) to ZIP...")
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for filepath in filepaths:
+                    fpath = Path(filepath)
+                    if fpath.is_file():
+                        # Add file to ZIP with relative name
+                        arcname = fpath.name
+                        zf.write(fpath, arcname=arcname)
+                    elif fpath.is_dir():
+                        # Recursively add directory contents
+                        for file_in_dir in fpath.rglob('*'):
+                            if file_in_dir.is_file():
+                                arcname = file_in_dir.relative_to(fpath.parent)
+                                zf.write(file_in_dir, arcname=str(arcname).replace('\\', '/'))
+            
+            zip_size = zip_path.stat().st_size
+            self._log_send(f"Compression complete: {self._format_file_size(zip_size)}")
+            return str(zip_path)
+        except Exception as e:
+            self._log_send(f"Compression failed: {e}")
+            raise
+
     def _send_file_thread(self, host, port, filepaths):
         """Thread function to send file(s) with progress callback"""
+        success = False
+        send_start_time = time.time()
+        total_size_sent = 0
+        transferred_files = []  # Track files for history
         try:
-            client = TransferClient(host, port)
+            client = TransferClient(host, port, pause_event=self._pause_event)
             self._log_send(f"Connecting to {host}:{port}...")
 
             # Progress callback updates UI
@@ -1903,6 +3128,17 @@ project on GitHub or contributing to its development!
             if len(filepaths) == 1 and os.path.isfile(filepaths[0]):
                 # Single file
                 fname = Path(filepaths[0]).name
+                
+                # Optional compression: if enabled and multiple files or large file, compress
+                files_to_send = filepaths
+                if self.compress_before_send:
+                    try:
+                        compressed_path = self._compress_files_to_zip(filepaths)
+                        files_to_send = [compressed_path]
+                        fname = Path(compressed_path).name
+                    except Exception as e:
+                        self._log_send(f"Warning: compression failed, sending uncompressed: {e}")
+                
                 self._log_send(f"Sending file: {fname} (resumable)")
                 try:
                     # update UI indicator: sending
@@ -1911,7 +3147,7 @@ project on GitHub or contributing to its development!
                         lambda: self.resumable_status_var.set("Resumable: Sending..."),
                     )
                     result = client.send_single_file(
-                        filepaths[0], progress_callback=progress_callback
+                        files_to_send[0], progress_callback=progress_callback
                     )
                     if isinstance(result, tuple):
                         offset, ok = result
@@ -1938,6 +3174,14 @@ project on GitHub or contributing to its development!
                         self.root.after(
                             0, lambda: self._log_send("File sent successfully!")
                         )
+                        # Track file for history
+                        try:
+                            fpath = Path(filepaths[0])
+                            if fpath.exists():
+                                total_size_sent += fpath.stat().st_size
+                                transferred_files.append(fname)
+                        except Exception:
+                            pass
                     else:
                         # backward compatibility: no tuple returned
                         self.root.after(
@@ -1949,6 +3193,14 @@ project on GitHub or contributing to its development!
                         self.root.after(
                             0, lambda: self._log_send("File sent successfully!")
                         )
+                        # Track file for history
+                        try:
+                            fpath = Path(filepaths[0])
+                            if fpath.exists():
+                                total_size_sent += fpath.stat().st_size
+                                transferred_files.append(fname)
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.root.after(0, lambda: self._log_send(f"Error: {e}"))
                     self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -1971,12 +3223,32 @@ project on GitHub or contributing to its development!
                 self.root.after(
                     0, lambda: self._log_send("Directory sent successfully!")
                 )
+                # Track directory for history
+                try:
+                    dir_path = Path(filepaths[0])
+                    dir_size = sum(f.stat().st_size for f in dir_path.rglob('*') if f.is_file())
+                    total_size_sent += dir_size
+                    transferred_files.append(dir_path.name)
+                except Exception:
+                    pass
             else:
                 # Multiple files/folders
                 self._log_send(f"Sending {len(filepaths)} item(s)...")
+                
+                # Optional compression: if enabled, create ZIP
+                files_to_send = filepaths
+                if self.compress_before_send:
+                    try:
+                        compressed_path = self._compress_files_to_zip(filepaths)
+                        files_to_send = [compressed_path]
+                        self._log_send("Sending compressed archive...")
+                    except Exception as e:
+                        self._log_send(f"Warning: compression failed, sending uncompressed: {e}")
+                        files_to_send = filepaths
+                
                 # Expand directories to files
                 all_files = []
-                for filepath in filepaths:
+                for filepath in files_to_send:
                     if os.path.isdir(filepath):
                         path = Path(filepath)
                         all_files.extend(path.rglob("*"))
@@ -1994,14 +3266,55 @@ project on GitHub or contributing to its development!
                             f"All {len(files_only)} file(s) sent successfully!"
                         ),
                     )
+                    # Track files for history
+                    try:
+                        for fpath in files_only:
+                            total_size_sent += fpath.stat().st_size
+                            transferred_files.append(fpath.name)
+                    except Exception:
+                        pass
 
             self.root.after(0, lambda: self.send_progress.config(value=100))
+
+            # mark overall success if we reached here without raising
+            success = True
+            
+            # Record transfer history
+            try:
+                duration = time.time() - send_start_time
+                if transferred_files and total_size_sent > 0:
+                    filename_display = transferred_files[0] if len(transferred_files) == 1 else f"{len(transferred_files)} files"
+                    self._add_transfer_history('send', filename_display, total_size_sent, duration)
+            except Exception as e:
+                self._log_send(f"Warning: Failed to record transfer history: {e}")
 
         except Exception as e:
             self.root.after(0, lambda: self._log_send(f"Error: {e}"))
             self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
         finally:
+            # Clean up temporary ZIP files if compression was used
+            if self.compress_before_send:
+                try:
+                    import tempfile
+                    # Try to remove any temp files created during compression
+                    temp_dir = Path(tempfile.gettempdir())
+                    for zip_file in temp_dir.glob('ft_*.zip'):
+                        try:
+                            if zip_file.exists():
+                                zip_file.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            
             self.root.after(0, lambda: self.send_btn.config(state="normal"))
+            # If send succeeded, clear the selected files list and update UI
+            try:
+                if success:
+                    # clear selection in main thread after a short delay so UI reflects final state
+                    self.root.after(500, lambda: (self.selected_files.clear(), self._update_files_listbox(), self._log_send("Send list cleared after successful send")))
+            except Exception:
+                pass
 
     # -------------------------
     # Server (receiver) logic
@@ -2010,6 +3323,10 @@ project on GitHub or contributing to its development!
         """Start the receiver server"""
         port_str = self.receive_port_entry.get().strip()
         output_dir = self.output_dir_var.get()
+        try:
+            output_dir = os.path.abspath(output_dir)
+        except Exception:
+            pass
         machine_name = self.machine_name_entry.get().strip() or socket.gethostname()
 
         if not machine_name:
@@ -2022,8 +3339,11 @@ project on GitHub or contributing to its development!
             messagebox.showerror("Error", "Port must be a number")
             return
 
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        # Create output directory if it doesn't exist (ensure absolute path)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception:
+            pass
 
         self.machine_name = machine_name
         self.server_running = True
@@ -2074,8 +3394,6 @@ project on GitHub or contributing to its development!
 
     def _stop_server(self):
         """Stop the receiver server"""
-        # The TransferServer class provided is blocking and returns after a single transfer.
-        # We set server_running False so UI knows it's stopped; actual thread will exit when server returns.
         self.server_running = False
         self.start_server_btn.config(state="normal")
         self.stop_server_btn.config(state="disabled")
@@ -2114,17 +3432,44 @@ project on GitHub or contributing to its development!
     def _run_server(self, port, output_dir):
         """Run server in thread"""
         try:
-            server = TransferServer(port=port, output_dir=output_dir)
+            # Progress callback from server to update Receive tab UI
+            def _server_progress(sent, total, speed=None, eta=None, filename=None):
+                try:
+                    progress = (sent / total) * 100 if total else 0
+                except Exception:
+                    progress = 0
+                try:
+                    # Update progress bar and text in the main thread
+                    self.root.after(0, lambda: self.recv_progress.config(value=progress))
+                    percent = int(progress)
+                    self.root.after(0, lambda: self.recv_progress_percent_var.set(f"{percent}%"))
+                    sent_str = self._format_file_size(sent)
+                    total_str = self._format_file_size(total)
+                    self.root.after(0, lambda: self.recv_bytes_var.set(f"{sent_str} / {total_str}"))
+                    if speed is not None:
+                        speed_str = self._format_transfer_speed(speed)
+                        self.root.after(0, lambda: self.recv_speed_var.set(f"Speed: {speed_str}"))
+                    else:
+                        self.root.after(0, lambda: self.recv_speed_var.set("Speed: -"))
+                    self.root.after(0, lambda: self.recv_eta_var.set(f"ETA: {self._format_eta(eta)}"))
+                except Exception:
+                    pass
 
-            # Wrap server._receive_files to log into GUI
-            # NOTE: TransferServer.start calls _receive_files(conn) directly,
-            # so we must wrap that method (not _receive_file) to intercept
-            # incoming transfers and show them in the Receive log.
+            # Log initialization to help diagnose receive issues
+            try:
+                self._log_receive(f"Initializing TransferServer on port {port}, output_dir={output_dir}")
+            except Exception:
+                pass
+            server = TransferServer(port=port, output_dir=output_dir, progress_callback=_server_progress)
+
             original_receive_files = server._receive_files
 
             def gui_receive_files(conn):
                 try:
                     peer_addr = conn.getpeername()
+                    recv_start_time = time.time()
+                    total_received_size = 0
+                    received_files = []
                     # mark that we just received a connection
                     try:
                         self.last_connection_time = time.time()
@@ -2161,6 +3506,8 @@ project on GitHub or contributing to its development!
                             for item in result:
                                 try:
                                     fname, fsize = item
+                                    total_received_size += fsize
+                                    received_files.append(fname)
                                     self.root.after(
                                         0,
                                         lambda fn=fname, fs=fsize: self._log_receive(
@@ -2170,26 +3517,33 @@ project on GitHub or contributing to its development!
                                     # Add to recent files list
                                     self.root.after(
                                         0,
-                                        lambda fn=fname, fs=fsize: self._add_recent_file(
-                                            fn, fs
-                                        ),
+                                        lambda fn=fname, fs=fsize: self._add_recent_file(fn, fs),
                                     )
                                 except Exception:
                                     pass
                         elif isinstance(result, tuple) and len(result) >= 2:
                             fname, fsize = result[0], result[1]
+                            total_received_size = fsize
+                            received_files.append(fname)
                             self.root.after(
                                 0,
                                 lambda: self._log_receive(
                                     f"Received: {fname} ({fsize} bytes)"
                                 ),
                             )
-                            self.root.after(
-                                0,
-                                lambda fn=fname, fs=fsize: self._add_recent_file(
-                                    fn, fs
-                                ),
-                            )
+                            self.root.after(0, lambda fn=fname, fs=fsize: self._add_recent_file(fn, fs))
+                            # Trigger notification
+                            self.root.after(0, lambda fn=fname: self._notify_file_received(fn))
+                        
+                        # Record transfer history for received files
+                        try:
+                            duration = time.time() - recv_start_time
+                            if received_files and total_received_size > 0:
+                                filename_display = received_files[0] if len(received_files) == 1 else f"{len(received_files)} files"
+                                self._add_transfer_history('recv', filename_display, total_received_size, duration)
+                        except Exception as e:
+                            self.root.after(0, lambda: self._log_receive(f"Warning: Failed to record transfer history: {e}"))
+                        
                         # after receiving, refresh discovery list (in case peers changed)
                         self.root.after(0, self._update_machines_list)
                         # Update tab badge
@@ -2257,6 +3611,44 @@ project on GitHub or contributing to its development!
             return deleted
         except Exception:
             return 0
+
+    def _on_recent_double_click(self, event):
+        """Open containing folder and select the recently received file."""
+        try:
+            sel = self.recent_files_listbox.curselection()
+            if not sel:
+                return
+            index = sel[0]
+            entry = self.recent_received_files[index]
+            fullpath = entry.get("path") if isinstance(entry, dict) else None
+            if not fullpath:
+                return
+            # If file exists, open Explorer and select it (Windows). Else open containing folder.
+            try:
+                if sys.platform.startswith("win"):
+                    # explorer /select,<path>
+                    subprocess.Popen(["explorer", "/select,", fullpath])
+                else:
+                    # Fallback: open containing folder
+                    folder = os.path.dirname(fullpath)
+                    if sys.platform == "darwin":
+                        subprocess.Popen(["open", folder])
+                    else:
+                        subprocess.Popen(["xdg-open", folder])
+            except Exception:
+                # Fallback to open folder
+                try:
+                    folder = os.path.dirname(fullpath)
+                    if sys.platform.startswith("win"):
+                        os.startfile(folder)
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", folder])
+                    else:
+                        subprocess.Popen(["xdg-open", folder])
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # -------------------------
     # Connection monitor (server health)
@@ -2389,9 +3781,53 @@ project on GitHub or contributing to its development!
                 try:
                     self.show_peer_details = bool(spd)
                 except Exception:
-                    self.show_peer_details = True
+                    self.show_peer_details = False
             else:
-                self.show_peer_details = True
+                self.show_peer_details = False
+            # Show peer details preference handled above
+            # NERV mode state
+            nerv_mode = data.get("nerv_mode")
+            if isinstance(nerv_mode, bool) and nerv_mode:
+                try:
+                    self._nerv_mode = True
+                    # Show MAGI tab and activate NERV display
+                    self.root.after(1000, self._restore_nerv_mode_on_startup)
+                except Exception:
+                    pass
+            # Receive port (apply to entry)
+            try:
+                rp = data.get("receive_port")
+                if rp is not None:
+                    try:
+                        self.receive_port_entry.delete(0, tk.END)
+                        self.receive_port_entry.insert(0, str(rp))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Output directory
+            try:
+                od = data.get("output_dir")
+                if isinstance(od, str) and od:
+                    try:
+                        self.output_dir_var.set(od)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Machine name
+            try:
+                mn = data.get("machine_name")
+                if isinstance(mn, str) and mn:
+                    try:
+                        self.machine_name_entry.delete(0, tk.END)
+                        self.machine_name_entry.insert(0, mn)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2411,14 +3847,40 @@ project on GitHub or contributing to its development!
         except Exception:
             data["auto_cleanup_partial"] = False
         try:
-            data["show_peer_details"] = bool(getattr(self, "show_peer_details", True))
+            data["show_peer_details"] = bool(getattr(self, "show_peer_details", False))
         except Exception:
-            data["show_peer_details"] = True
+            data["show_peer_details"] = False
+        # Persist receive port, output directory and machine name
+        try:
+            data["receive_port"] = self.receive_port_entry.get().strip()
+        except Exception:
+            data["receive_port"] = "5000"
+        try:
+            try:
+                data["output_dir"] = os.path.abspath(self.output_dir_var.get())
+            except Exception:
+                data["output_dir"] = self.output_dir_var.get()
+        except Exception:
+            data["output_dir"] = os.path.join(os.getcwd(), "ReceivedFiles")
+        try:
+            data["machine_name"] = self.machine_name_entry.get().strip()
+        except Exception:
+            data["machine_name"] = socket.gethostname()
+        # Save NERV mode state
+        try:
+            data["nerv_mode"] = bool(getattr(self, "_nerv_mode", False))
+        except Exception:
+            data["nerv_mode"] = False
         try:
             with open(self._config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            # Attempt to log the error to the GUI log file so user can diagnose
+            try:
+                with open(self._log_file_path, 'a', encoding='utf-8') as lf:
+                    lf.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] [ERROR] [CONFIG] Failed writing config: {e}\n")
+            except Exception:
+                pass
 
     # -------------------------
     # Main / cleanup
