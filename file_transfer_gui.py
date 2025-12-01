@@ -1354,6 +1354,26 @@ class FileTransferGUI:
             self.receive_port_entry.delete(0, tk.END)
             self.receive_port_entry.insert(0, recv_port_var.get().strip())
             self.output_dir_var.set(dir_var.get().strip())
+            # If server is running, update its output directory immediately
+            try:
+                new_dir = dir_var.get().strip()
+                if new_dir:
+                    try:
+                        new_dir = os.path.abspath(new_dir)
+                    except Exception:
+                        pass
+                    if getattr(self, 'server_running', False) and getattr(self, '_server_instance', None):
+                        try:
+                            os.makedirs(new_dir, exist_ok=True)
+                        except Exception:
+                            pass
+                        try:
+                            self._server_instance.output_dir = Path(new_dir)
+                            self._log_receive(f"Updated server output_dir to: {new_dir}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             # Save discovery preference
             try:
                 self.broadcast_only_var.set(discover_chk_var.get())
@@ -2491,23 +2511,27 @@ project on GitHub or contributing to its development!
         """Add file to recently received files list."""
         try:
             size_str = self._format_file_size(filesize)
-            display = f"{filename} ({size_str})"
-
-            # Determine full path: if filename absolute, use it; otherwise join with output dir
+            # If filename is an absolute path, show only basename in the list but
+            # keep the full path for selection. If it's relative, compute fullpath
+            # by joining with configured output directory.
             try:
                 p = Path(filename)
-                if not p.is_absolute():
-                    fullpath = os.path.join(self.output_dir_var.get(), filename)
-                else:
+                if p.is_absolute():
                     fullpath = str(p)
+                    display_name = os.path.basename(fullpath)
+                else:
+                    fullpath = os.path.join(self.output_dir_var.get(), filename)
+                    display_name = filename
             except Exception:
                 fullpath = os.path.join(self.output_dir_var.get(), filename)
+                display_name = os.path.basename(fullpath)
+
+            display = f"{display_name} ({size_str})"
 
             # Keep only last 20 files
             if len(self.recent_received_files) >= 20:
                 self.recent_files_listbox.delete(0, 0)
                 self.recent_received_files.pop(0)
-
             self.recent_received_files.append({"path": fullpath, "display": display})
             self.recent_files_listbox.insert(tk.END, display)
             self.recent_files_listbox.see(tk.END)
@@ -2517,8 +2541,14 @@ project on GitHub or contributing to its development!
     def _update_tab_badge(self):
         """Update badge on Receive Files tab when files arrive."""
         try:
+            # Use a stable unicode icon for the tab and show count when available.
             if self.recent_received_files:
-                self.notebook.tab(1, text=f"Receive Files ðŸ””")
+                try:
+                    count = len(self.recent_received_files)
+                    # inbox tray emoji + count
+                    self.notebook.tab(1, text=f"📥 Receive Files ({count})")
+                except Exception:
+                    self.notebook.tab(1, text="📥 Receive Files")
             else:
                 self.notebook.tab(1, text="Receive Files")
         except Exception:
@@ -2849,6 +2879,23 @@ project on GitHub or contributing to its development!
             except Exception:
                 pass
             self.output_dir_var.set(directory)
+            # If server is running, update its output directory immediately so
+            # newly received files are saved to the selected folder without
+            # requiring a server restart.
+            try:
+                if getattr(self, 'server_running', False) and getattr(self, '_server_instance', None):
+                    try:
+                        # ensure directory exists
+                        os.makedirs(directory, exist_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        self._server_instance.output_dir = Path(directory)
+                        self._log_receive(f"Updated server output_dir to: {directory}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def _human_readable_age(self, seconds: int) -> str:
         """Return a compact human-readable age for seconds (e.g., '5s', '2m', '1h')."""
@@ -3428,6 +3475,11 @@ project on GitHub or contributing to its development!
             self.server_start_time = None
         except Exception:
             pass
+        # Clear stored server instance reference
+        try:
+            self._server_instance = None
+        except Exception:
+            pass
 
     def _run_server(self, port, output_dir):
         """Run server in thread"""
@@ -3461,6 +3513,12 @@ project on GitHub or contributing to its development!
             except Exception:
                 pass
             server = TransferServer(port=port, output_dir=output_dir, progress_callback=_server_progress)
+            # Keep a reference to the running server so the GUI can update its
+            # output directory while it's running (user may change Save folder).
+            try:
+                self._server_instance = server
+            except Exception:
+                self._server_instance = None
 
             original_receive_files = server._receive_files
 
@@ -3515,9 +3573,14 @@ project on GitHub or contributing to its development!
                                         ),
                                     )
                                     # Add to recent files list
+                                    # Compute full path based on server's output_dir (capture now)
+                                    try:
+                                        fullp = os.path.join(str(server.output_dir), fname)
+                                    except Exception:
+                                        fullp = fname
                                     self.root.after(
                                         0,
-                                        lambda fn=fname, fs=fsize: self._add_recent_file(fn, fs),
+                                        lambda fp=fullp, fs=fsize: self._add_recent_file(fp, fs),
                                     )
                                 except Exception:
                                     pass
@@ -3531,7 +3594,11 @@ project on GitHub or contributing to its development!
                                     f"Received: {fname} ({fsize} bytes)"
                                 ),
                             )
-                            self.root.after(0, lambda fn=fname, fs=fsize: self._add_recent_file(fn, fs))
+                            try:
+                                fullp = os.path.join(str(server.output_dir), fname)
+                            except Exception:
+                                fullp = fname
+                            self.root.after(0, lambda fp=fullp, fs=fsize: self._add_recent_file(fp, fs))
                             # Trigger notification
                             self.root.after(0, lambda fn=fname: self._notify_file_received(fn))
                         
@@ -3563,7 +3630,11 @@ project on GitHub or contributing to its development!
             self.root.after(0, lambda: self._log_receive(f"Server error: {e}"))
             self.root.after(0, lambda: messagebox.showerror("Server Error", str(e)))
         finally:
-            # Ensure UI updated as stopped when server loop exits
+            # Clear server instance reference and ensure UI updated as stopped when server loop exits
+            try:
+                self._server_instance = None
+            except Exception:
+                pass
             self.root.after(0, self._stop_server)
 
     # -------------------------
@@ -3623,30 +3694,65 @@ project on GitHub or contributing to its development!
             fullpath = entry.get("path") if isinstance(entry, dict) else None
             if not fullpath:
                 return
-            # If file exists, open Explorer and select it (Windows). Else open containing folder.
+            # Normalize path and open the containing folder, selecting the file when possible.
             try:
+                fullpath = os.path.abspath(fullpath)
+                folder = os.path.dirname(fullpath)
+
                 if sys.platform.startswith("win"):
-                    # explorer /select,<path>
-                    subprocess.Popen(["explorer", "/select,", fullpath])
+                    # If file exists, request Explorer to select it using a single argument
+                    # e.g. explorer "/select,C:\path\to\file.txt"
+                    if os.path.exists(fullpath):
+                        try:
+                            subprocess.Popen(["explorer", f"/select,{fullpath}"])
+                        except Exception:
+                            # Fallback: open containing folder
+                            try:
+                                os.startfile(folder)
+                            except Exception:
+                                pass
+                    else:
+                        # If file missing, open the folder if it exists
+                        if os.path.isdir(folder):
+                            try:
+                                os.startfile(folder)
+                            except Exception:
+                                pass
+                        else:
+                            # As last resort, open user's home folder
+                            try:
+                                os.startfile(os.path.expanduser("~"))
+                            except Exception:
+                                pass
+
+                elif sys.platform == "darwin":
+                    # macOS: use 'open -R' to reveal the file, or open the folder
+                    if os.path.exists(fullpath):
+                        try:
+                            subprocess.Popen(["open", "-R", fullpath])
+                        except Exception:
+                            try:
+                                subprocess.Popen(["open", folder])
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            subprocess.Popen(["open", folder])
+                        except Exception:
+                            pass
+
                 else:
-                    # Fallback: open containing folder
-                    folder = os.path.dirname(fullpath)
-                    if sys.platform == "darwin":
-                        subprocess.Popen(["open", folder])
-                    else:
+                    # Linux/other: no reliable cross-distro 'select' behaviour; open folder
+                    try:
                         subprocess.Popen(["xdg-open", folder])
+                    except Exception:
+                        try:
+                            # fallback using generic open
+                            subprocess.Popen(["open", folder])
+                        except Exception:
+                            pass
             except Exception:
-                # Fallback to open folder
-                try:
-                    folder = os.path.dirname(fullpath)
-                    if sys.platform.startswith("win"):
-                        os.startfile(folder)
-                    elif sys.platform == "darwin":
-                        subprocess.Popen(["open", folder])
-                    else:
-                        subprocess.Popen(["xdg-open", folder])
-                except Exception:
-                    pass
+                pass
         except Exception:
             pass
 
