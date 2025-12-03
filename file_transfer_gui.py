@@ -4079,7 +4079,12 @@ project on GitHub or contributing to its development!
 def main():
     # Prefer the Tk wrapper from tkinterdnd2 if available so DnD works.
     if TKDND_AVAILABLE and TkinterDnD:
-        root = TkinterDnD()
+        # Standard usage: TkinterDnD provides a Tk-compatible class
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:
+            # Fallback in case of unexpected tkinterdnd2 variant
+            root = tk.Tk()
     else:
         root = tk.Tk()
     app = FileTransferGUI(root)
