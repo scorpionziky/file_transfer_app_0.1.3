@@ -2,10 +2,11 @@
   "broadcast_only": false,
   "partial_cleanup_days": 30,
   "auto_cleanup_partial": false,
-  "show_peer_details": false,
+  "show_peer_details": false
   "receive_port": "5000",
   "output_dir": "C:\\Users\\scorp\\Desktop\\ReceivedFiles",
   "machine_name": "Andrea01",
   "nerv_mode": false,
-  "compress_before_send": false
+  "compress_before_send": false,
+  "notify_on_receive": false
 }

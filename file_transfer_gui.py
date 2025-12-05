@@ -13,6 +13,7 @@ import webbrowser
 import sys
 import json
 import subprocess
+import shutil
 import zipfile
 from pathlib import Path
 from transfer_server import TransferServer
@@ -165,12 +166,22 @@ class FileTransferGUI:
         # Initialize preference variables BEFORE creating menu (menu uses these)
         # Notification preference (beep on new file received)
         self.notify_on_receive = True
+        # BooleanVar for menu checkbutton (persisted UI state)
+        try:
+            self.notify_on_receive_var = tk.BooleanVar(value=self.notify_on_receive)
+        except Exception:
+            self.notify_on_receive_var = None
         
         # Discovery filter: optional IP subnet filter (e.g., '192.168.1.')
         self.discovery_ip_filter = None  # None = no filter (accept all)
         
         # Compression preference
         self.compress_before_send = False
+        # BooleanVar for menu checkbutton (persisted UI state)
+        try:
+            self.compress_before_send_var = tk.BooleanVar(value=self.compress_before_send)
+        except Exception:
+            self.compress_before_send_var = None
 
         # Transfer control: pause/resume state
         self.transfer_paused = False
@@ -547,12 +558,12 @@ class FileTransferGUI:
             label="Discovery IP Filter...", command=self._open_discovery_filter_dialog
         )
         advanced_menu.add_checkbutton(
-            label="Notify on file received (beep)", variable=tk.BooleanVar(value=self.notify_on_receive),
-            command=lambda: setattr(self, 'notify_on_receive', not self.notify_on_receive)
+            label="Notify on file received (beep)", variable=(self.notify_on_receive_var if getattr(self, 'notify_on_receive_var', None) is not None else tk.BooleanVar(value=self.notify_on_receive)),
+            command=lambda: setattr(self, 'notify_on_receive', bool(self.notify_on_receive_var.get()) if getattr(self, 'notify_on_receive_var', None) is not None else not self.notify_on_receive)
         )
         advanced_menu.add_checkbutton(
-            label="Compress before send (ZIP)", variable=tk.BooleanVar(value=self.compress_before_send),
-            command=self._toggle_compress_before_send
+            label="Compress before send (ZIP)", variable=(self.compress_before_send_var if getattr(self, 'compress_before_send_var', None) is not None else tk.BooleanVar(value=self.compress_before_send)),
+            command=lambda: self._apply_compress_var()
         )
 
         # Settings menu
@@ -3043,6 +3054,20 @@ project on GitHub or contributing to its development!
         status = "On" if self.compress_before_send else "Off"
         self.compress_status_var.set(f"Compression: {status}")
 
+    def _apply_compress_var(self):
+        """Apply the value from the compress BooleanVar (menu) to internal state and UI."""
+        try:
+            if getattr(self, 'compress_before_send_var', None) is not None:
+                val = bool(self.compress_before_send_var.get())
+                self.compress_before_send = val
+                status = "On" if self.compress_before_send else "Off"
+                try:
+                    self.compress_status_var.set(f"Compression: {status}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _send_file(self):
         """Send file(s) or folder in separate thread"""
         host = self.host_entry.get().strip()
@@ -3769,12 +3794,16 @@ project on GitHub or contributing to its development!
                 folder = os.path.dirname(fullpath)
 
                 if sys.platform.startswith("win"):
-                    # On Windows, open the containing folder
+                    # On Windows, try to reveal/select the file in Explorer
                     if os.path.exists(fullpath):
                         try:
-                            os.startfile(folder)
+                            fp = os.path.normpath(fullpath)
+                            subprocess.Popen(["explorer", f"/select,{fp}"])
                         except Exception:
-                            pass
+                            try:
+                                os.startfile(folder)
+                            except Exception:
+                                pass
                     else:
                         # If file missing, open the current configured folder
                         current_folder = self.output_dir_var.get().strip()
@@ -3816,7 +3845,7 @@ project on GitHub or contributing to its development!
                                 pass
 
                 else:
-                    # Linux/other: open folder with xdg-open
+                    # Linux/other: try to reveal/select using common file managers, fallback to xdg-open
                     current_folder = self.output_dir_var.get().strip()
                     if current_folder and os.path.isdir(current_folder):
                         folder_to_open = current_folder
@@ -3824,15 +3853,42 @@ project on GitHub or contributing to its development!
                         folder_to_open = folder
                     else:
                         folder_to_open = None
-                    
-                    if folder_to_open:
+
+                    if os.path.exists(fullpath):
+                        # Try file-manager specific 'select' options
                         try:
-                            subprocess.Popen(["xdg-open", folder_to_open])
+                            if shutil.which("nautilus"):
+                                subprocess.Popen(["nautilus", "--select", fullpath])
+                            elif shutil.which("dolphin"):
+                                subprocess.Popen(["dolphin", "--select", fullpath])
+                            elif shutil.which("thunar"):
+                                # thunar has no --select in all versions; open folder instead
+                                subprocess.Popen(["thunar", folder])
+                            elif shutil.which("pcmanfm"):
+                                subprocess.Popen(["pcmanfm", "--select", fullpath])
+                            else:
+                                # Fallback to opening the containing folder
+                                if folder and os.path.isdir(folder):
+                                    subprocess.Popen(["xdg-open", folder])
+                                elif folder_to_open:
+                                    subprocess.Popen(["xdg-open", folder_to_open])
                         except Exception:
                             try:
-                                subprocess.Popen(["open", folder_to_open])
+                                if folder and os.path.isdir(folder):
+                                    subprocess.Popen(["xdg-open", folder])
+                                elif folder_to_open:
+                                    subprocess.Popen(["xdg-open", folder_to_open])
                             except Exception:
                                 pass
+                    else:
+                        if folder_to_open:
+                            try:
+                                subprocess.Popen(["xdg-open", folder_to_open])
+                            except Exception:
+                                try:
+                                    subprocess.Popen(["open", folder_to_open])
+                                except Exception:
+                                    pass
             except Exception:
                 pass
         except Exception:
@@ -4026,6 +4082,25 @@ project on GitHub or contributing to its development!
                     if hasattr(self, 'compress_status_var'):
                         status = "On" if self.compress_before_send else "Off"
                         self.compress_status_var.set(f"Compression: {status}")
+                    # Keep menu var in sync if present
+                    try:
+                        if getattr(self, 'compress_before_send_var', None) is not None:
+                            self.compress_before_send_var.set(bool(cb))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Notification preference (beep)
+            try:
+                nb = data.get("notify_on_receive")
+                if isinstance(nb, bool):
+                    try:
+                        self.notify_on_receive = bool(nb)
+                        if getattr(self, 'notify_on_receive_var', None) is not None:
+                            self.notify_on_receive_var.set(bool(nb))
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception:
@@ -4076,6 +4151,11 @@ project on GitHub or contributing to its development!
             data["compress_before_send"] = bool(getattr(self, "compress_before_send", False))
         except Exception:
             data["compress_before_send"] = False
+        # Save notification preference
+        try:
+            data["notify_on_receive"] = bool(getattr(self, "notify_on_receive", True))
+        except Exception:
+            data["notify_on_receive"] = True
         try:
             with open(self._config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
